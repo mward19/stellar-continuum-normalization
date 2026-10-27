@@ -1,3 +1,5 @@
 __marimo__
 .venv
 .python-version
+logs/
+__pycache__
