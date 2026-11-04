@@ -12,6 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, fields
 
 import numpy as np
+from scipy import sparse
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm, trange
 
@@ -87,6 +88,7 @@ class BOSZSpectra:
         # Cache: spectra waiting to be written to the next group file
         self._pending = {} # SpectrumID -> processed spectrum
         self._maps = OrderedDict() # cache_file -> np.memmap
+        self._locations = None # SpectrumID -> (cache_file, row_index), loaded on demand
         if self.use_cache:
             self._open_cache()
             # Don't lose spectra computed ad hoc (e.g. via spectra[i]) at exit
@@ -219,6 +221,52 @@ class BOSZSpectra:
 
         self._next_index += 1
         self._pending.clear()
+        self._locations = None # stale now that rows were added
+
+    def _location_index(self):
+        """
+        Maps every indexed SpectrumID to (cache_file, row_index). It is read with a single query
+        (instead of one per spectrum) the first time it is needed, and is dropped whenever new
+        spectra are flushed to the cache.
+        """
+        if self._locations is None:
+            cols = ", ".join(self._ID_COLS)
+            rows = self.db.execute(f"SELECT {cols}, cache_file, row_index FROM spectra")
+            self._locations = {SpectrumID(*row[:-2]): (row[-2], row[-1]) for row in rows}
+        return self._locations
+
+    def _read_cached_batch(self, ids):
+        """
+        Reads many cached spectra at once, one read per group file instead of one per spectrum.
+        Returns an array of shape (len(ids), D) in the order of `ids`, or None if any of them is
+        not (cleanly) in the cache, in which case the caller should fall back to per-spectrum access.
+        Doesn't touch the sqlite connection once the location index is loaded, so it is safe to
+        use in forked workers.
+        """
+        if not self.use_cache or any(id in self._pending for id in ids):
+            return None
+        locations = self._location_index()
+
+        by_file = {} # cache_file -> (positions in the output, rows in the file)
+        for position, id in enumerate(ids):
+            location = locations.get(id)
+            if location is None:
+                return None
+            positions, rows = by_file.setdefault(location[0], ([], []))
+            positions.append(position)
+            rows.append(location[1])
+
+        out = None
+        for cache_file, (positions, rows) in by_file.items():
+            try:
+                data = np.load(self.cache_dir / cache_file, mmap_mode="r")
+            except FileNotFoundError:
+                return None # index points at a missing file; caller recomputes
+            if out is None:
+                out = np.empty((len(ids), data.shape[1]), dtype=data.dtype)
+            order = np.argsort(rows) # ascending rows give sequential reads
+            out[np.asarray(positions)[order]] = data[np.asarray(rows)[order]]
+        return out
 
     def _read_cached(self, id):
         if id in self._pending:
@@ -415,39 +463,27 @@ class BOSZSpectra:
         return spectrum
 
     def __getitem__(self, i):
+        # A slice or a sequence of indices returns a 2D array of shape (n, D), one spectrum per row
+        if isinstance(i, (slice, list, tuple, np.ndarray)):
+            ids = self.ids[i] if isinstance(i, slice) else [self.ids[j] for j in i]
+            if len(ids) == 0:
+                return np.empty((0, len(self.wave_out)))
+            batch = self._read_cached_batch(ids)
+            if batch is not None:
+                return batch
+            return np.stack([self.process_spectrum(id) for id in ids])
         return self.process_spectrum(self.ids[i])
+
+    def sparse(self, i, tol=1e-2, floor=1e-10):
+        """
+        Optical depth -log(flux) for a slice (or one index) as a scipy CSR matrix of shape (n, D).
+        Entries below `tol` are dropped, which is what makes it sparse; flux is floored at
+        `floor` so fully saturated lines give a finite value rather than inf.
+        """
+        dense = np.atleast_2d(self[i])
+        tau = -np.log(np.clip(dense, floor, 1.0))
+        tau[tau < tol] = 0
+        return sparse.csr_matrix(tau)
 
     def __len__(self):
         return len(self.ids)
-
-
-if __name__ == "__main__":
-    import argparse
-
-    # Defaults match the settings used in test_processing.py
-    ap = argparse.ArgumentParser(description="Process and cache all BOSZ spectra")
-    ap.add_argument("--root", type=Path, default=Path("/home/mward19/nobackup/autodelete/bosz-spectra/data"))
-    ap.add_argument("--cache-dir", type=Path, default=Path("/home/mward19/nobackup/autodelete/bosz-spectra/processed"))
-    ap.add_argument("--R-in", type=float, default=300_000)
-    ap.add_argument("--R-out", type=float, default=115_000)
-    ap.add_argument("--D", type=int, default=3000)
-    ap.add_argument("--wave-min", type=float, default=3000)
-    ap.add_argument("--wave-max", type=float, default=7000)
-    ap.add_argument("--spectra-per-file", type=int, default=1000)
-    ap.add_argument("--n-workers", type=int, default=None, help="default: SLURM_CPUS_PER_TASK")
-    ap.add_argument("--force-recompute", action="store_true")
-    args = ap.parse_args()
-
-    spectra = BOSZSpectra(
-        args.root,
-        args.R_in,
-        args.R_out,
-        D=args.D,
-        wave_min=args.wave_min,
-        wave_max=args.wave_max,
-        cache_dir=args.cache_dir,
-        spectra_per_file=args.spectra_per_file,
-    )
-    print(f"{len(spectra)} spectra found; caching to {args.cache_dir}", flush=True)
-    spectra.process_all_spectra(force_recompute=args.force_recompute, n_workers=args.n_workers)
-    print("Done", flush=True)

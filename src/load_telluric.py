@@ -7,7 +7,10 @@ import numpy as np
 from astropy.io import fits
 from tqdm import tqdm
 
-from load_spectra import BOSZSpectra
+try:
+    from .load_spectra import BOSZSpectra
+except ImportError:  # run as a script
+    from load_spectra import BOSZSpectra
 
 
 class TelluricSpectra:
@@ -167,26 +170,3 @@ class TelluricSpectra:
 
     def __len__(self):
         return len(self.M)
-
-
-if __name__ == "__main__":
-    import argparse
-
-    # Defaults match the stellar settings in load_spectra.py
-    ap = argparse.ArgumentParser(description="Reconstruct and cache the telluric -log(T) matrix")
-    ap.add_argument("--pca-file", type=Path, default=Path("/home/mward19/nobackup/autodelete/telluric/TellPCA_3000_10500_R120000.fits"))
-    ap.add_argument("--cache-dir", type=Path, default=Path("/home/mward19/nobackup/autodelete/telluric/processed"))
-    ap.add_argument("--R-out", type=float, default=115_000)
-    ap.add_argument("--D", type=int, default=3000)
-    ap.add_argument("--wave-min", type=float, default=3000)
-    ap.add_argument("--wave-max", type=float, default=7000)
-    ap.add_argument("--n-pca", type=int, default=4)
-    ap.add_argument("--t-floor", type=float, default=1e-10)
-    args = ap.parse_args()
-
-    tell = TelluricSpectra(
-        args.pca_file, args.D, args.wave_min, args.wave_max,
-        R_out=args.R_out, n_pca=args.n_pca, t_floor=args.t_floor, cache_dir=args.cache_dir,
-    )
-    print(f"{len(tell)} telluric spectra, -log(T) in [{tell.M.min():.3g}, {tell.M.max():.3g}], "
-          f"cached to {args.cache_dir}", flush=True)

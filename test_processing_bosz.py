@@ -12,7 +12,7 @@ def _():
     from matplotlib import pyplot as plt
     from tqdm.auto import trange, tqdm
 
-    from load_spectra import BOSZSpectra
+    from src.load_spectra import BOSZSpectra
 
     return BOSZSpectra, NMF, Path, np, plt, tqdm
 
@@ -41,6 +41,29 @@ def _(spectra):
 
 
 @app.cell
+def _(spectra):
+    -spectra[100]
+    return
+
+
+@app.cell
+def _(np, plt, spectra):
+    _lil_spectrum = -np.log(spectra[110])
+    _rounders = _lil_spectrum < 1e-9
+    _lil_spectrum[_rounders] = 0
+    _mask = np.isclose(_lil_spectrum, np.zeros_like(_lil_spectrum))
+    plt.plot(np.exp(-_lil_spectrum))
+    # plt.show()
+    print(np.sum(_mask))
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
 def _(cached_ids, plt, spectra, tqdm, wave):
 
     for _i, _id in tqdm(enumerate(list(cached_ids)[100:110])):
@@ -50,7 +73,7 @@ def _(cached_ids, plt, spectra, tqdm, wave):
         plt.xlabel("Angstroms")
         plt.ylabel("Normalized Intensity")
         plt.title(f"processed spectrum {_i}")
-        plt.show()
+    # plt.show()
     return
 
 

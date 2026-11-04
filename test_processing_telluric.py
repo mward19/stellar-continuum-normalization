@@ -12,7 +12,7 @@ def _():
     import numpy as np
     from matplotlib import pyplot as plt
 
-    from load_telluric import TelluricSpectra
+    from src.load_telluric import TelluricSpectra
 
     return NMF, Path, TelluricSpectra, mo, np, plt
 
@@ -85,6 +85,11 @@ def _(nmf, telluric_matrix):
     # How well do 4 basis vectors reconstruct the telluric matrix?
     _recon = nmf.transform(telluric_matrix) @ nmf.components_
     nmf.reconstruction_err_, abs(_recon - telluric_matrix).mean()
+    return
+
+
+@app.cell
+def _():
     return
 
 

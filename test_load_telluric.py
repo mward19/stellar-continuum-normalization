@@ -5,10 +5,10 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-from load_telluric import TelluricSpectra
+from src.load_telluric import TelluricSpectra
 
 PCA_FILE = Path("~/nobackup/autodelete/telluric/TellPCA_3000_10500_R120000.fits").expanduser()
-pytestmark = pytest.mark.skipif(not PCA_FILE.is_file(), reason="run download_scripts/download_telluric.sh first")
+pytestmark = pytest.mark.skipif(not PCA_FILE.is_file(), reason="run scripts/download_telluric.sh first")
 
 KW = dict(D=3000, wave_min=3000, wave_max=7000, R_out=115_000, n_pca=4)
 

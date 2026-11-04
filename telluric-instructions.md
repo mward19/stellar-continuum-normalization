@@ -1,4 +1,4 @@
-In load_spectra.py, I have written code to process a bunch of spectra. The script download_scripts/download_all_bosz.py downloads the BOSZ spectra. Now I want to download and process the data for telluric lines, as in pages 4 and 5 of https://iopscience.iop.org/article/10.3847/1538-4357/ae3bd6/pdf. I want to replicate their work as closely as possible. Make a plan for the telluric download scripts and the load_telluric.py file that will make it possible to process the telluric data.
+In src/load_spectra.py, I have written code to process a bunch of spectra. The script scripts/download_all_bosz.py downloads the BOSZ spectra. Now I want to download and process the data for telluric lines, as in pages 4 and 5 of https://iopscience.iop.org/article/10.3847/1538-4357/ae3bd6/pdf. I want to replicate their work as closely as possible. Make a plan for the telluric download scripts and the load_telluric.py file that will make it possible to process the telluric data.
 
 # Plan
 
@@ -38,7 +38,7 @@ In load_spectra.py, I have written code to process a bunch of spectra. The scrip
 - Provenance (PypeIt docs): LBLRTM v12.17, HITRAN 2016 line parameters, six observatories at different altitudes.
 - Scratch copies and inspection scripts live in `~/nobackup/autodelete/tmp/codex/tell` and `~/nobackup/autodelete/tmp/codex/*.py`. They are not part of the deliverable.
 
-## 3. Download script: `download_scripts/download_telluric.sh`
+## 3. Download script: `scripts/download_telluric.sh`
 
 - Same style as `get_scripts_bosz.sh`: `set -euo pipefail`, `curl --fail --location --retry 3`, download to a `mktemp` name, then `mv` into place.
 - Keep the base URL and filename in variables at the top.

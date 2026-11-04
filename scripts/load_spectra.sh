@@ -17,11 +17,11 @@ export MKL_NUM_THREADS=1
 # Safe to resubmit if the job times out: cached spectra are skipped and at most
 # the last partial group (< --spectra-per-file spectra) is recomputed.
 # Extra arguments passed to sbatch are appended and override the ones below.
-uv run load_spectra.py \
+uv run src/load_spectra.py \
     --root /home/mward19/nobackup/autodelete/bosz-spectra/data \
     --cache-dir /home/mward19/nobackup/autodelete/bosz-spectra/processed-harps \
     --R-in 300000 \
-    --R-out 3707.32 \
+    --R-out 115000 \
     --D 3000 \
     --wave-min 3000 \
     --wave-max 7000 \
