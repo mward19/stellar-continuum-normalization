@@ -39,11 +39,13 @@ class ContinuumNormalizer:
             telluric_spectra: TelluricSpectra,
             flux_errors,
             order_wavelengths,
+            debug_max_files=None,
             K=16, # number of stellar absorbtion basis vectors
             L=4,  # number of telluric absorbtion basis vectors
             n_modes=9, # Fourier continuum modes per row of order_wavelengths
             F_kwargs=None, # passed to get_F, e.g. to match an existing cache
             G_kwargs=None, # passed to get_G
+            debug_max_F_spectra=None,
         ):
         self.bosz_spectra = bosz_spectra         # Matrix S
         self.telluric_spectra = telluric_spectra # Matrix M
@@ -57,6 +59,12 @@ class ContinuumNormalizer:
         self.flux_errors = flux_errors
         self.order_wavelengths = order_wavelengths
 
+        if debug_max_F_spectra is not None and debug_max_F_spectra < 1:
+            raise ValueError("debug_max_F_spectra must be a positive integer or None")
+        if debug_max_F_spectra is None:
+            debug_max_F_spectra = getattr(bosz_spectra, "debug_max_F_spectra", None)
+        self.debug_max_F_spectra = None if debug_max_F_spectra is None else int(debug_max_F_spectra)
+
         self.S_log = None # sparse -log(flux) matrix, built on demand (see get_sparse_S_log)
         self._S_log_key = None # (tol, floor) that S_log was built with
         self.train_rows = None # rows of S_log to train on; None means all (see filter_spectra)
@@ -66,137 +74,6 @@ class ContinuumNormalizer:
         self.get_G(**(G_kwargs or {}))
         self.get_H(n_modes)
 
-    @classmethod
-    def from_cache(cls, F_path, G_path, flux_errors, order_wavelengths, n_modes=9):
-        """
-        Builds a normalizer from already-cached NMF results (the nmf_F_<hash>.npy and
-        nmf_G_<hash>.npy files), without constructing BOSZSpectra or TelluricSpectra. The
-        wavelength grids F and G live on are rebuilt from the parameters in the .json beside
-        each file.
-        """
-        F_path, G_path = Path(F_path), Path(G_path)
-        self = cls.__new__(cls) # skip __init__, which would compute or look up F and G
-        self.S_log, self._S_log_key, self.train_rows, self.train_filter = None, None, None, None
-
-        self.F = np.load(F_path)
-        self.G = np.load(G_path)
-        self.K, self.L = len(self.F), len(self.G)
-
-        bosz = json.loads(F_path.with_suffix(".json").read_text())["bosz"]
-        telluric = json.loads(G_path.with_suffix(".json").read_text())["telluric"]
-        self.bosz_wave_out = np.geomspace(bosz["wave_min"], bosz["wave_max"], bosz["D"])
-        self.telluric_wave_out = np.geomspace(telluric["wave_min"], telluric["wave_max"], telluric["D"])
-
-        self.flux_errors = flux_errors
-        self.order_wavelengths = order_wavelengths
-        self.get_H(n_modes)
-        return self
-
-    # ---- NMF cache: an .npy plus a .json of the parameters, stored in the spectra's cache_dir ----
-
-    @staticmethod
-    def _nmf_cache_paths(cache_dir, name, params, suffix=".npy"):
-        # Parameters are hashed into the file name so different settings can coexist in one
-        # cache_dir; the json beside the data file records what they were.
-        key = hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()[:10]
-        return cache_dir / f"{name}_{key}{suffix}", cache_dir / f"{name}_{key}.json"
-
-    @classmethod
-    def _load_nmf(cls, cache_dir, name, params):
-        if cache_dir is None:
-            return None
-        npy_path, json_path = cls._nmf_cache_paths(cache_dir, name, params)
-        if json_path.is_file() and npy_path.is_file(): # json is written last
-            return np.load(npy_path)
-        return None
-
-    @classmethod
-    def _save_nmf(cls, cache_dir, name, params, array):
-        if cache_dir is None:
-            return
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        npy_path, json_path = cls._nmf_cache_paths(cache_dir, name, params)
-
-        # Same scheme as the loaders: write to a temp name, rename, json last
-        tmp_npy = npy_path.with_name(npy_path.name + f".{os.getpid()}.tmp")
-        with open(tmp_npy, "wb") as f:
-            np.save(f, array)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_npy, npy_path)
-
-        tmp_json = json_path.with_name(json_path.name + f".{os.getpid()}.tmp")
-        tmp_json.write_text(json.dumps(params, indent=2, sort_keys=True))
-        os.replace(tmp_json, json_path)
-
-    def get_sparse_S_log(self, tol=1e-2, floor=1e-10, chunk_size=1000, n_workers=None):
-        """
-        Builds the whole sparse -log(flux) matrix of the BOSZ spectra once (float32 CSR, one row
-        per spectrum, in the order of self.bosz_spectra.ids), so that NMF epochs only index rows
-        instead of rereading and reprocessing every spectrum. It is cached as an .npz in the
-        BOSZ cache_dir and also held in memory in self.S_log, so it has to fit in RAM.
-
-        tol and floor are passed to BOSZSpectra.sparse. The chunks are built by n_workers forked
-        processes (default: SLURM_CPUS_PER_TASK, else the usable core count), which requires every
-        spectrum to be cached already (see BOSZSpectra.process_all_spectra).
-        """
-        params = {
-            "tol": float(tol), "floor": float(floor),
-            "n_spectra": len(self.bosz_spectra),
-            "bosz": self.bosz_spectra._processing_params(),
-            "sparse_version": SPARSE_VERSION,
-        }
-        cache_dir = self.bosz_spectra.cache_dir
-        if cache_dir is not None:
-            npz_path, json_path = self._nmf_cache_paths(cache_dir, "sparse_S_log", params, ".npz")
-            if json_path.is_file() and npz_path.is_file(): # json is written last
-                tqdm.write(f"Loading cached sparse matrix from {npz_path}")
-                self.S_log = sparse.load_npz(npz_path).tocsr()
-                self._S_log_key = (float(tol), float(floor))
-                return
-
-        n = len(self.bosz_spectra)
-        bounds = [(a, min(a + chunk_size, n)) for a in range(0, n, chunk_size)]
-        if n_workers is None:
-            n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", len(os.sched_getaffinity(0))))
-
-        global _BUILD_STATE
-        _BUILD_STATE = (self.bosz_spectra, tol, floor)
-        if n_workers <= 1:
-            chunks = [_build_sparse_chunk(b) for b in tqdm(bounds, unit="chunk", desc="Building sparse -log(flux) matrix")]
-        else:
-            # Workers must not compute or touch the sqlite connection they inherit through fork, so
-            # check that everything is cached and load the location index before forking
-            if len(self.bosz_spectra._cached_ids()) < n:
-                raise RuntimeError("Not every BOSZ spectrum is cached; run BOSZSpectra.process_all_spectra first")
-            self.bosz_spectra._location_index()
-            with multiprocessing.get_context("fork").Pool(n_workers) as pool:
-                chunks = list(tqdm(pool.imap(_build_sparse_chunk, bounds), total=len(bounds),
-                                   unit="chunk", desc=f"Building sparse -log(flux) matrix ({n_workers} workers)"))
-        self.S_log = sparse.vstack(chunks, format="csr")
-        self._S_log_key = (float(tol), float(floor))
-        tqdm.write(f"Sparse matrix: shape {self.S_log.shape}, density {self.S_log.nnz / np.prod(self.S_log.shape):.2%}, "
-                   f"{(self.S_log.data.nbytes + self.S_log.indices.nbytes + self.S_log.indptr.nbytes) / 1e9:.2f} GB")
-
-        if cache_dir is not None:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp_npz = npz_path.with_name(npz_path.name + f".{os.getpid()}.tmp")
-            with open(tmp_npz, "wb") as f:
-                sparse.save_npz(f, self.S_log, compressed=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_npz, npz_path)
-
-            tmp_json = json_path.with_name(json_path.name + f".{os.getpid()}.tmp")
-            tmp_json.write_text(json.dumps(params, indent=2, sort_keys=True))
-            os.replace(tmp_json, json_path)
-
-    def _ensure_S_log(self, tol, floor):
-        """Builds (or loads) S_log unless the one in memory was made with the same tol and floor."""
-        if self.S_log is None or self._S_log_key != (float(tol), float(floor)):
-            self.S_log = None # let the old matrix go before building another
-            self.get_sparse_S_log(tol=tol, floor=floor)
-
     def filter_spectra(self, atmos=("mp", "ms"), teff_max=8000):
         """
         Optional: restricts the spectra that get_F and fit_full train on. Call it before them.
@@ -204,7 +81,7 @@ class ContinuumNormalizer:
         "ap" is ATLAS), and Teff <= 8000 K. Pass atmos=None or teff_max=None to skip either.
         """
         keep = []
-        for row, id in enumerate(self.bosz_spectra.ids):
+        for row, id in enumerate(self.bosz_spectra.ids[:self._n_F_spectra()]):
             if atmos is not None and id.atmos not in atmos:
                 continue
             if teff_max is not None and int(id.teff.lstrip("t")) > teff_max:
@@ -216,7 +93,7 @@ class ContinuumNormalizer:
             "atmos": None if atmos is None else sorted(atmos),
             "teff_max": None if teff_max is None else float(teff_max),
         }
-        tqdm.write(f"Training on {len(keep)} of {len(self.bosz_spectra)} spectra ({self.train_filter})")
+        tqdm.write(f"Training on {len(keep)} of {self._n_F_spectra()} selected spectra ({self.train_filter})")
 
     def _report_residuals(self, nmf, rows, n_samples, seed):
         """
@@ -240,110 +117,115 @@ class ContinuumNormalizer:
         )
 
     def _train_rows(self):
-        return np.arange(len(self.bosz_spectra)) if self.train_rows is None else self.train_rows
+        return np.arange(self._n_F_spectra()) if self.train_rows is None else self.train_rows
 
-    def get_F(self, n_epochs=3, batch_size=256, seed=0, sparse_tol=1e-6, sparse_floor=1e-10, residual_samples=20_000):
+    def get_F(
+            self,
+            n_epochs=3,
+            batch_size=256,
+            seed=0,
+            sparse_tol=None,
+            sparse_floor=1e-10,
+            residual_samples=20_000,
+            batch=False,
+            max_iter=10_000,
+            tol=1e-4,
+            init="nndsvda",
+        ):
+        """Builds F from BOSZ spectra using coordinate descent by default.
+
+        Set ``batch=True`` to use MiniBatchNMF instead. In batch mode, ``n_epochs`` is the
+        number of passes over the spectra, each in a fresh random batch order, and ``batch_size``
+        sets the maximum spectra per batch.
+
+        ``sparse_tol`` defaults to 1e-2 for coordinate descent and 1e-6 for batch mode. After
+        fitting, residuals are reported on ``residual_samples`` random spectra (or all spectra if
+        there are fewer).
         """
-        Performs NMF on the sparse -log(flux) matrix of self.bosz_spectra (see get_sparse_S_log). This calculates
-        the matrix F of stellar absorbtion basis vectors.
+        if sparse_tol is None:
+            sparse_tol = 1e-6 if batch else 1e-2
 
-        n_epochs is the number of passes over all spectra, each in a fresh random batch order.
-        Afterwards the reconstruction residuals are reported on residual_samples random spectra
-        (or on all of them, if there are fewer).
-        """
-        params = {
-            "K": int(self.K), "n_epochs": int(n_epochs), "batch_size": int(batch_size), "seed": int(seed),
-            "n_spectra": len(self.bosz_spectra),
-            "bosz": self.bosz_spectra._processing_params(),
-            "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
-            "sparse_version": SPARSE_VERSION,
-            "nmf_version": NMF_VERSION,
-        }
-        if self.train_filter is not None: # left out otherwise, so unfiltered caches keep their names
-            params["filter"] = self.train_filter
-        cache_dir = self.bosz_spectra.cache_dir
-        cached = self._load_nmf(cache_dir, "nmf_F", params)
-        if cached is not None:
-            tqdm.write(f"Loaded cached F from {cache_dir}")
-            self.F = cached
-            return
-
-        # Row-indexing this in-memory matrix replaces reprocessing the spectra every epoch
-        self._ensure_S_log(sparse_tol, sparse_floor)
-
-        nmf_F = MiniBatchNMF(
-            n_components=self.K,
-            forget_factor=1,
-            random_state=seed,
-            verbose=False
-        )
-
-        rng = np.random.default_rng(seed)
-        rows = self._train_rows()
-
-        for epoch in trange(n_epochs, unit="epoch", desc="Performing NMF on BOSZ spectra"):
-            # shuffle the indices, then split into batches no larger than batch_size
-            order = rng.permutation(rows)
-            batches = [np.sort(order[a:a + batch_size]) for a in range(0, len(rows), batch_size)]
-
-            for batch in tqdm(batches, desc=f"NMF epoch {epoch + 1}/{n_epochs}", leave=False):
-                nmf_F.partial_fit(self.S_log[batch])
-
-        self._report_residuals(nmf_F, rows, residual_samples, seed)
-
-        self.F = nmf_F.components_
-        self._save_nmf(cache_dir, "nmf_F", params, self.F)
-
-    def fit_full(self, max_iter=10_000, seed=0, tol=1e-4, init="nndsvda", sparse_tol=1e-2, sparse_floor=1e-10, residual_samples=20_000):
-        """
-        Alternative to get_F that follows the paper's recipe: one ordinary (not mini-batch) NMF of
-        the whole sparse -log(flux) matrix by coordinate descent, with nonnegative double SVD
-        initialization ("nndsvda"). Respects filter_spectra if it was called. This calculates the
-        matrix F of stellar absorbtion basis vectors and replaces self.F.
-
-        sklearn stops early once the violation falls below tol; pass tol=0 to always run max_iter
-        steps, as the paper does. The default sparse_tol is much larger than get_F's, so the
-        matrix is sparse (about 30% dense instead of ~100%) and the solver is fast.
-        """
-        params = {
-            "K": int(self.K), "max_iter": int(max_iter), "seed": int(seed), "tol": float(tol),
-            "init": init, "solver": "cd",
-            "n_spectra": len(self.bosz_spectra),
-            "bosz": self.bosz_spectra._processing_params(),
-            "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
-            "sparse_version": SPARSE_VERSION,
-            "nmf_version": NMF_VERSION,
-        }
+        if batch:
+            cache_name = "nmf_F"
+            params = {
+                "K": int(self.K), "n_epochs": int(n_epochs), "batch_size": int(batch_size),
+                "seed": int(seed), "solver": "minibatch",
+                "n_spectra": self._n_F_spectra(),
+                "bosz": self.bosz_spectra._processing_params(),
+                "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
+                "sparse_version": SPARSE_VERSION,
+                "nmf_version": NMF_VERSION,
+            }
+        else:
+            cache_name = "nmf_F_full"
+            params = {
+                "K": int(self.K), "max_iter": int(max_iter), "seed": int(seed),
+                "tol": float(tol), "init": init, "solver": "cd",
+                "n_spectra": self._n_F_spectra(),
+                "bosz": self.bosz_spectra._processing_params(),
+                "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
+                "sparse_version": SPARSE_VERSION,
+                "nmf_version": NMF_VERSION,
+            }
         if self.train_filter is not None:
             params["filter"] = self.train_filter
+
         cache_dir = self.bosz_spectra.cache_dir
-        cached = self._load_nmf(cache_dir, "nmf_F_full", params)
+        cached = self._load_nmf(cache_dir, cache_name, params)
         if cached is not None:
             tqdm.write(f"Loaded cached F from {cache_dir}")
             self.F = cached
             return
 
         self._ensure_S_log(sparse_tol, sparse_floor)
-        X = self.S_log if self.train_rows is None else self.S_log[self.train_rows]
-        tqdm.write(f"Fitting NMF to {X.shape[0]} x {X.shape[1]} matrix, density {X.nnz / np.prod(X.shape):.2%}")
+        rows = self._train_rows()
 
-        nmf_F = NMF(
-            n_components=self.K,
-            init=init,
-            solver="cd",
-            max_iter=max_iter,
-            tol=tol,
-            random_state=seed,
-            shuffle=True, # visit the coordinates in random order
-            verbose=1,
-        )
-        nmf_F.fit(X)
-
-        tqdm.write(f"NMF finished after {nmf_F.n_iter_} iterations")
-        self._report_residuals(nmf_F, self._train_rows(), residual_samples, seed)
+        if batch:
+            nmf_F = MiniBatchNMF(
+                n_components=self.K,
+                forget_factor=1,
+                random_state=seed,
+                verbose=False,
+            )
+            rng = np.random.default_rng(seed)
+            for epoch in trange(n_epochs, unit="epoch", desc="Performing NMF on BOSZ spectra"):
+                order = rng.permutation(rows)
+                batches = [np.sort(order[a:a + batch_size]) for a in range(0, len(rows), batch_size)]
+                for row_batch in tqdm(batches, desc=f"NMF epoch {epoch + 1}/{n_epochs}", leave=False):
+                    nmf_F.partial_fit(self.S_log[row_batch])
+            self._report_residuals(nmf_F, rows, residual_samples, seed)
+        else:
+            X = self.S_log if self.train_rows is None else self.S_log[self.train_rows]
+            tqdm.write(f"Fitting NMF to {X.shape[0]} x {X.shape[1]} matrix, density {X.nnz / np.prod(X.shape):.2%}")
+            nmf_F = NMF(
+                n_components=self.K,
+                init=init,
+                solver="cd",
+                max_iter=max_iter,
+                tol=tol,
+                random_state=seed,
+                shuffle=True,
+                verbose=1,
+            )
+            nmf_F.fit(X)
+            tqdm.write(f"NMF finished after {nmf_F.n_iter_} iterations")
+            self._report_residuals(nmf_F, rows, residual_samples, seed)
 
         self.F = nmf_F.components_
-        self._save_nmf(cache_dir, "nmf_F_full", params, self.F)
+        self._save_nmf(cache_dir, cache_name, params, self.F)
+
+    def fit_full(self, max_iter=10_000, seed=0, tol=1e-4, init="nndsvda", sparse_tol=1e-2, sparse_floor=1e-10, residual_samples=20_000):
+        """Compatibility wrapper for ``get_F(batch=False, ...)``."""
+        return self.get_F(
+            batch=False,
+            max_iter=max_iter,
+            seed=seed,
+            tol=tol,
+            init=init,
+            sparse_tol=sparse_tol,
+            sparse_floor=sparse_floor,
+            residual_samples=residual_samples,
+        )
 
     def get_G(self, max_iter=10_000, seed=0):
         """
@@ -451,6 +333,143 @@ class ContinuumNormalizer:
         result = lsq_linear(A, weight * Y, bounds=(lower, upper), method="trf", lsq_solver="lsmr")
         X = result.x
         return X[:K], X[K:K + L], X[K + L:].reshape(-1, self.n_modes)
+
+    # ---- Caching and data management ----
+
+    @classmethod
+    def from_cache(cls, F_path, G_path, flux_errors, order_wavelengths, n_modes=9):
+        """
+        Builds a normalizer from already-cached NMF results (the nmf_F_<hash>.npy and
+        nmf_G_<hash>.npy files), without constructing BOSZSpectra or TelluricSpectra. The
+        wavelength grids F and G live on are rebuilt from the parameters in the .json beside
+        each file.
+        """
+        F_path, G_path = Path(F_path), Path(G_path)
+        self = cls.__new__(cls) # skip __init__, which would compute or look up F and G
+        self.S_log, self._S_log_key, self.train_rows, self.train_filter = None, None, None, None
+
+        self.F = np.load(F_path)
+        self.G = np.load(G_path)
+        self.K, self.L = len(self.F), len(self.G)
+
+        bosz = json.loads(F_path.with_suffix(".json").read_text())["bosz"]
+        telluric = json.loads(G_path.with_suffix(".json").read_text())["telluric"]
+        self.bosz_wave_out = np.geomspace(bosz["wave_min"], bosz["wave_max"], bosz["D"])
+        self.telluric_wave_out = np.geomspace(telluric["wave_min"], telluric["wave_max"], telluric["D"])
+
+        self.flux_errors = flux_errors
+        self.order_wavelengths = order_wavelengths
+        self.get_H(n_modes)
+        return self
+
+    # ---- Sparse matrix and NMF cache helpers ----
+
+    @staticmethod
+    def _nmf_cache_paths(cache_dir, name, params, suffix=".npy"):
+        # Parameters are hashed into the file name so different settings can coexist in one
+        # cache_dir; the json beside the data file records what they were.
+        key = hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()[:10]
+        return cache_dir / f"{name}_{key}{suffix}", cache_dir / f"{name}_{key}.json"
+
+    @classmethod
+    def _load_nmf(cls, cache_dir, name, params):
+        if cache_dir is None:
+            return None
+        npy_path, json_path = cls._nmf_cache_paths(cache_dir, name, params)
+        if json_path.is_file() and npy_path.is_file(): # json is written last
+            return np.load(npy_path)
+        return None
+
+    @classmethod
+    def _save_nmf(cls, cache_dir, name, params, array):
+        if cache_dir is None:
+            return
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        npy_path, json_path = cls._nmf_cache_paths(cache_dir, name, params)
+
+        # Same scheme as the loaders: write to a temp name, rename, json last
+        tmp_npy = npy_path.with_name(npy_path.name + f".{os.getpid()}.tmp")
+        with open(tmp_npy, "wb") as f:
+            np.save(f, array)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_npy, npy_path)
+
+        tmp_json = json_path.with_name(json_path.name + f".{os.getpid()}.tmp")
+        tmp_json.write_text(json.dumps(params, indent=2, sort_keys=True))
+        os.replace(tmp_json, json_path)
+
+    def get_sparse_S_log(self, tol=1e-2, floor=1e-10, chunk_size=1000, n_workers=None):
+        """
+        Builds the sparse -log(flux) matrix of the selected BOSZ spectra (float32 CSR, one row
+        per spectrum), so NMF epochs can index rows instead of rereading and reprocessing every
+        spectrum. It is cached as an .npz in the BOSZ cache_dir and held in memory in self.S_log.
+
+        tol and floor are passed to BOSZSpectra.sparse. Multiprocess chunk building requires the
+        selected spectra to be cached already (see BOSZSpectra.process_all_spectra).
+        """
+        n = self._n_F_spectra()
+        params = {
+            "tol": float(tol), "floor": float(floor),
+            "n_spectra": n,
+            "bosz": self.bosz_spectra._processing_params(),
+            "sparse_version": SPARSE_VERSION,
+        }
+        cache_dir = self.bosz_spectra.cache_dir
+        if cache_dir is not None:
+            npz_path, json_path = self._nmf_cache_paths(cache_dir, "sparse_S_log", params, ".npz")
+            if json_path.is_file() and npz_path.is_file(): # json is written last
+                tqdm.write(f"Loading cached sparse matrix from {npz_path}")
+                self.S_log = sparse.load_npz(npz_path).tocsr()
+                self._S_log_key = (float(tol), float(floor))
+                return
+
+        bounds = [(a, min(a + chunk_size, n)) for a in range(0, n, chunk_size)]
+        if n_workers is None:
+            n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", len(os.sched_getaffinity(0))))
+
+        global _BUILD_STATE
+        _BUILD_STATE = (self.bosz_spectra, tol, floor)
+        if n_workers <= 1:
+            chunks = [_build_sparse_chunk(b) for b in tqdm(bounds, unit="chunk", desc="Building sparse -log(flux) matrix")]
+        else:
+            # Workers must not compute or touch the sqlite connection they inherit through fork, so
+            # check that everything is cached and load the location index before forking
+            needed_ids = set(self.bosz_spectra.ids[:n])
+            if not needed_ids.issubset(self.bosz_spectra._cached_ids()):
+                raise RuntimeError("Not every selected BOSZ spectrum is cached; run BOSZSpectra.process_all_spectra first")
+            self.bosz_spectra._location_index()
+            with multiprocessing.get_context("fork").Pool(n_workers) as pool:
+                chunks = list(tqdm(pool.imap(_build_sparse_chunk, bounds), total=len(bounds),
+                                   unit="chunk", desc=f"Building sparse -log(flux) matrix ({n_workers} workers)"))
+        self.S_log = sparse.vstack(chunks, format="csr")
+        self._S_log_key = (float(tol), float(floor))
+        tqdm.write(f"Sparse matrix: shape {self.S_log.shape}, density {self.S_log.nnz / np.prod(self.S_log.shape):.2%}, "
+                   f"{(self.S_log.data.nbytes + self.S_log.indices.nbytes + self.S_log.indptr.nbytes) / 1e9:.2f} GB")
+
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp_npz = npz_path.with_name(npz_path.name + f".{os.getpid()}.tmp")
+            with open(tmp_npz, "wb") as f:
+                sparse.save_npz(f, self.S_log, compressed=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_npz, npz_path)
+
+            tmp_json = json_path.with_name(json_path.name + f".{os.getpid()}.tmp")
+            tmp_json.write_text(json.dumps(params, indent=2, sort_keys=True))
+            os.replace(tmp_json, json_path)
+
+    def _ensure_S_log(self, tol, floor):
+        """Builds (or loads) S_log unless the one in memory was made with the same tol and floor."""
+        if self.S_log is None or self._S_log_key != (float(tol), float(floor)):
+            self.S_log = None # let the old matrix go before building another
+            self.get_sparse_S_log(tol=tol, floor=floor)
+
+    def _n_F_spectra(self):
+        """Number of BOSZ rows selected for building and training F."""
+        n = len(self.bosz_spectra)
+        return n if self.debug_max_F_spectra is None else min(n, self.debug_max_F_spectra)
 
 def read_harps_e2ds(path):
     """

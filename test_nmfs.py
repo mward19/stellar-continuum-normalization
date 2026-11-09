@@ -61,7 +61,7 @@ def _(ContinuumNormalizer, bosz, np, telluric):
         telluric,
         flux_errors=1e-8 * np.ones(3000),
         order_wavelengths=wave,
-        F_kwargs=dict(n_epochs=4, batch_size=1024),
+        F_kwargs=dict(batch=True, n_epochs=4, batch_size=1024),
     )
     return cn, wave
 

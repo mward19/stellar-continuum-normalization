@@ -68,7 +68,39 @@ class TelluricSpectra:
             if self.cache_dir is not None:
                 self._save_cache()
 
-    # ---- Cache: one .npy plus a json of the parameters ----
+    # ---- Scientific calculations ----
+
+    def _compute(self):
+        comp, wave, coefs = self._read_pca_file()
+
+        # Crop with a pad so the convolution doesn't see the edge
+        pad = 0.01
+        sel = (wave >= self.wave_min * (1 - pad)) & (wave <= self.wave_max * (1 + pad))
+        if wave[sel].min() > self.wave_min or wave[sel].max() < self.wave_max:
+            raise ValueError(
+                f"Requested range {self.wave_min}-{self.wave_max} is outside the file's "
+                f"{wave.min():.0f}-{wave.max():.0f} Angstrom"
+            )
+        wave = wave[sel]
+        mean = comp[0, sel]
+        basis = comp[1:self.n_pca + 1, sel]
+
+        M = np.empty((len(coefs), self.D), dtype=np.float32)
+        for i in tqdm(range(len(coefs)), unit="spectrum", desc="Reconstructing telluric spectra", mininterval=10):
+            tau = np.clip(np.sinh(mean + coefs[i, :self.n_pca] @ basis), 0, None)
+            T = np.exp(-tau)
+            if self.R_out is not None:
+                T = BOSZSpectra.convolve_to_R(np.column_stack((wave, T)), self.R_in, self.R_out)
+            T = np.interp(self.wave_out, wave, T)
+            M[i] = -np.log(np.clip(T, self.t_floor, 1.0))
+        return M
+
+    # ---- Access ----
+
+    def transmission(self, i):
+        return np.exp(-self.M[i])
+
+    # ---- Caching and data management ----
 
     def _params(self):
         return {
@@ -121,8 +153,6 @@ class TelluricSpectra:
         tmp_json.write_text(json.dumps(self._params(), indent=2))
         os.replace(tmp_json, json_path)
 
-    # ---- Reconstruction ----
-
     def _read_pca_file(self):
         with fits.open(self.pca_file) as hdul:
             ncomp = hdul[0].header.get("NCOMP")
@@ -134,36 +164,6 @@ class TelluricSpectra:
         if self.n_pca > ncomp:
             raise ValueError(f"n_pca ({self.n_pca}) is more than the {ncomp} components in the file")
         return comp, wave, coefs
-
-    def _compute(self):
-        comp, wave, coefs = self._read_pca_file()
-
-        # Crop with a pad so the convolution doesn't see the edge
-        pad = 0.01
-        sel = (wave >= self.wave_min * (1 - pad)) & (wave <= self.wave_max * (1 + pad))
-        if wave[sel].min() > self.wave_min or wave[sel].max() < self.wave_max:
-            raise ValueError(
-                f"Requested range {self.wave_min}-{self.wave_max} is outside the file's "
-                f"{wave.min():.0f}-{wave.max():.0f} Angstrom"
-            )
-        wave = wave[sel]
-        mean = comp[0, sel]
-        basis = comp[1:self.n_pca + 1, sel]
-
-        M = np.empty((len(coefs), self.D), dtype=np.float32)
-        for i in tqdm(range(len(coefs)), unit="spectrum", desc="Reconstructing telluric spectra", mininterval=10):
-            tau = np.clip(np.sinh(mean + coefs[i, :self.n_pca] @ basis), 0, None)
-            T = np.exp(-tau)
-            if self.R_out is not None:
-                T = BOSZSpectra.convolve_to_R(np.column_stack((wave, T)), self.R_in, self.R_out)
-            T = np.interp(self.wave_out, wave, T)
-            M[i] = -np.log(np.clip(T, self.t_floor, 1.0))
-        return M
-
-    # ---- Access ----
-
-    def transmission(self, i):
-        return np.exp(-self.M[i])
 
     def __getitem__(self, i):
         return self.M[i] # -log(T); corresponding wavelengths are in self.wave_out

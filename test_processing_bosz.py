@@ -36,8 +36,8 @@ def _(BOSZSpectra, Path):
 
 @app.cell
 def _(spectra):
-    cached_ids = spectra._cached_ids()
-    return (cached_ids,)
+    spectra
+    return
 
 
 @app.cell
