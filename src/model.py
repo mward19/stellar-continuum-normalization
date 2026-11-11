@@ -10,6 +10,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -43,9 +44,12 @@ class ContinuumNormalizer:
             K=16, # number of stellar absorbtion basis vectors
             L=4,  # number of telluric absorbtion basis vectors
             n_modes=9, # Fourier continuum modes per row of order_wavelengths
-            F_kwargs=None, # passed to get_F, e.g. to match an existing cache
+            F_kwargs=None, # passed to F_fit_method
             G_kwargs=None, # passed to get_G
             debug_max_F_spectra=None,
+            F_filter=None, # passed to filter_spectra before fitting F
+            F_fit_method="get_F", # method used to build F
+            force_recompute_F=False, # skip cached F and run the selected fitting method
         ):
         self.bosz_spectra = bosz_spectra         # Matrix S
         self.telluric_spectra = telluric_spectra # Matrix M
@@ -69,8 +73,11 @@ class ContinuumNormalizer:
         self._S_log_key = None # (tol, floor) that S_log was built with
         self.train_rows = None # rows of S_log to train on; None means all (see filter_spectra)
         self.train_filter = None
+        self.force_recompute_F = bool(force_recompute_F)
+        if F_filter is not None:
+            self.filter_spectra(**F_filter)
 
-        self.get_F(**(F_kwargs or {}))
+        getattr(self, F_fit_method)(**(F_kwargs or {}))
         self.get_G(**(G_kwargs or {}))
         self.get_H(n_modes)
 
@@ -94,6 +101,13 @@ class ContinuumNormalizer:
             "teff_max": None if teff_max is None else float(teff_max),
         }
         tqdm.write(f"Training on {len(keep)} of {self._n_F_spectra()} selected spectra ({self.train_filter})")
+
+    @staticmethod
+    def _relative_residual(nmf, X):
+        """Relative Frobenius reconstruction error for a batch of spectra."""
+        X_dense = X.toarray().astype(np.float64)
+        reconstruction = nmf.transform(X).astype(np.float64) @ nmf.components_.astype(np.float64)
+        return np.linalg.norm(X_dense - reconstruction) / np.linalg.norm(X_dense)
 
     def _report_residuals(self, nmf, rows, n_samples, seed):
         """
@@ -119,112 +133,212 @@ class ContinuumNormalizer:
     def _train_rows(self):
         return np.arange(self._n_F_spectra()) if self.train_rows is None else self.train_rows
 
-    def get_F(
+    def get_F(self, batch=False, **kwargs):
+        """Build F with full NMF, or MiniBatchNMF when ``batch=True``."""
+        method = self.get_F_batch if batch else self.get_F_full
+        return method(**kwargs)
+
+    def _load_F_cache(self, cache_name, params):
+        if self.train_filter is not None:
+            params["filter"] = self.train_filter
+
+        cache_dir = self.bosz_spectra.cache_dir
+        if self.force_recompute_F:
+            tqdm.write(f"Skipping cached {cache_name}; force_recompute_F=True")
+            cached = None
+        else:
+            cached = self._load_nmf(cache_dir, cache_name, params)
+        if cached is not None:
+            tqdm.write(f"Loaded cached F from {cache_dir}")
+            self.F = cached
+        return cache_dir, cached
+
+    def get_F_batch(
             self,
-            n_epochs=3,
+            max_epochs=1000,
             batch_size=256,
             seed=0,
             sparse_tol=None,
             sparse_floor=1e-10,
             residual_samples=20_000,
-            batch=False,
-            max_iter=10_000,
             tol=1e-4,
-            init="nndsvda",
+            tol_batches=3,
+            check_interval=50,
         ):
-        """Builds F from BOSZ spectra using coordinate descent by default.
-
-        Set ``batch=True`` to use MiniBatchNMF instead. In batch mode, ``n_epochs`` is the
-        number of passes over the spectra, each in a fresh random batch order, and ``batch_size``
-        sets the maximum spectra per batch.
-
-        ``sparse_tol`` defaults to 1e-2 for coordinate descent and 1e-6 for batch mode. After
-        fitting, residuals are reported on ``residual_samples`` random spectra (or all spectra if
-        there are fewer).
-        """
+        """Fit with MiniBatchNMF; check basis convergence every ``check_interval`` batches."""
+        if tol_batches < 1 or check_interval < 1:
+            raise ValueError("tol_batches and check_interval must be positive integers")
         if sparse_tol is None:
-            sparse_tol = 1e-6 if batch else 1e-2
+            sparse_tol = 1e-6
 
-        if batch:
-            cache_name = "nmf_F"
-            params = {
-                "K": int(self.K), "n_epochs": int(n_epochs), "batch_size": int(batch_size),
-                "seed": int(seed), "solver": "minibatch",
-                "n_spectra": self._n_F_spectra(),
-                "bosz": self.bosz_spectra._processing_params(),
-                "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
-                "sparse_version": SPARSE_VERSION,
-                "nmf_version": NMF_VERSION,
-            }
-        else:
-            cache_name = "nmf_F_full"
-            params = {
-                "K": int(self.K), "max_iter": int(max_iter), "seed": int(seed),
-                "tol": float(tol), "init": init, "solver": "cd",
-                "n_spectra": self._n_F_spectra(),
-                "bosz": self.bosz_spectra._processing_params(),
-                "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
-                "sparse_version": SPARSE_VERSION,
-                "nmf_version": NMF_VERSION,
-            }
-        if self.train_filter is not None:
-            params["filter"] = self.train_filter
-
-        cache_dir = self.bosz_spectra.cache_dir
-        cached = self._load_nmf(cache_dir, cache_name, params)
+        cache_name = "nmf_F"
+        params = {
+            "K": int(self.K), "max_epochs": int(max_epochs), "batch_size": int(batch_size),
+            "seed": int(seed), "solver": "minibatch", "tol": float(tol),
+            "tol_batches": int(tol_batches), "check_interval": int(check_interval),
+            "tol_metric": "relative_component_change",
+            "n_spectra": self._n_F_spectra(),
+            "bosz": self.bosz_spectra._processing_params(),
+            "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
+            "sparse_version": SPARSE_VERSION, "nmf_version": NMF_VERSION,
+        }
+        cache_dir, cached = self._load_F_cache(cache_name, params)
         if cached is not None:
-            tqdm.write(f"Loaded cached F from {cache_dir}")
-            self.F = cached
             return
 
         self._ensure_S_log(sparse_tol, sparse_floor)
         rows = self._train_rows()
+        nmf_F = MiniBatchNMF(
+            n_components=self.K,
+            forget_factor=1,
+            random_state=seed,
+            verbose=False,
+        )
+        rng = np.random.default_rng(seed)
+        consecutive_converged_checks = 0
+        batches_seen = 0
+        previous_components = None
+        converged = False
+        for epoch in trange(max_epochs, unit="epoch", desc="Performing NMF on BOSZ spectra"):
+            order = rng.permutation(rows)
+            batches = [np.sort(order[a:a + batch_size]) for a in range(0, len(rows), batch_size)]
+            batch_progress = tqdm(batches, desc=f"NMF epoch {epoch + 1}/{max_epochs}", leave=False)
+            for row_batch in batch_progress:
+                nmf_F.partial_fit(self.S_log[row_batch])
+                if previous_components is None:
+                    previous_components = nmf_F.components_.copy()
+                batches_seen += 1
+                if batches_seen % check_interval:
+                    continue
 
-        if batch:
-            nmf_F = MiniBatchNMF(
-                n_components=self.K,
-                forget_factor=1,
-                random_state=seed,
-                verbose=False,
-            )
-            rng = np.random.default_rng(seed)
-            for epoch in trange(n_epochs, unit="epoch", desc="Performing NMF on BOSZ spectra"):
-                order = rng.permutation(rows)
-                batches = [np.sort(order[a:a + batch_size]) for a in range(0, len(rows), batch_size)]
-                for row_batch in tqdm(batches, desc=f"NMF epoch {epoch + 1}/{n_epochs}", leave=False):
-                    nmf_F.partial_fit(self.S_log[row_batch])
-            self._report_residuals(nmf_F, rows, residual_samples, seed)
-        else:
-            X = self.S_log if self.train_rows is None else self.S_log[self.train_rows]
-            tqdm.write(f"Fitting NMF to {X.shape[0]} x {X.shape[1]} matrix, density {X.nnz / np.prod(X.shape):.2%}")
-            nmf_F = NMF(
-                n_components=self.K,
-                init=init,
-                solver="cd",
-                max_iter=max_iter,
-                tol=tol,
-                random_state=seed,
-                shuffle=True,
-                verbose=1,
-            )
-            nmf_F.fit(X)
-            tqdm.write(f"NMF finished after {nmf_F.n_iter_} iterations")
-            self._report_residuals(nmf_F, rows, residual_samples, seed)
+                sample_rows = rng.choice(rows, size=min(batch_size, len(rows)), replace=False)
+                sample_residual = self._relative_residual(nmf_F, self.S_log[sample_rows])
+                components = nmf_F.components_
+                component_change = np.linalg.norm(components - previous_components) / max(
+                    np.linalg.norm(components), np.finfo(components.dtype).eps
+                )
+                previous_components = components.copy()
+                batch_progress.set_postfix(
+                    residual=f"{sample_residual:.3e}",
+                    basis_change=f"{component_change:.3e}",
+                )
+                consecutive_converged_checks = (
+                    consecutive_converged_checks + 1 if component_change <= tol else 0
+                )
+                if consecutive_converged_checks >= tol_batches:
+                    tqdm.write(
+                        f"MiniBatchNMF converged after {epoch + 1} epochs: relative basis "
+                        f"change <= {tol:g} for {tol_batches} consecutive checks, "
+                        f"spaced {check_interval} batches apart"
+                    )
+                    converged = True
+                    break
+            # Keep the most recent complete epoch so long-running jobs can be resumed
+            # with a useful F even if they do not reach the final cache write below.
+            self._save_nmf(cache_dir, f"{cache_name}_last_epoch", params, nmf_F.components_)
+            if converged:
+                break
 
+        self._report_residuals(nmf_F, rows, residual_samples, seed)
         self.F = nmf_F.components_
         self._save_nmf(cache_dir, cache_name, params, self.F)
 
-    def fit_full(self, max_iter=10_000, seed=0, tol=1e-4, init="nndsvda", sparse_tol=1e-2, sparse_floor=1e-10, residual_samples=20_000):
+    def get_F_full(
+            self,
+            max_iter=10_000,
+            seed=0,
+            sparse_tol=None,
+            sparse_floor=1e-10,
+            residual_samples=20_000,
+            tol=0.0,
+            init="nndsvda",
+        ):
+        """Fit F with full coordinate-descent NMF.
+
+        Set ``tol=0`` to run exactly ``max_iter`` iterations, as in Casey et al. (2026).
+        """
+        if sparse_tol is None:
+            sparse_tol = 1e-2
+        cache_name = "nmf_F_full"
+        params = {
+            "K": int(self.K), "max_iter": int(max_iter), "seed": int(seed),
+            "tol": float(tol), "init": init, "solver": "cd",
+            "n_spectra": self._n_F_spectra(),
+            "bosz": self.bosz_spectra._processing_params(),
+            "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
+            "sparse_version": SPARSE_VERSION, "nmf_version": NMF_VERSION,
+        }
+        cache_dir, cached = self._load_F_cache(cache_name, params)
+        if cached is not None:
+            return
+
+        stage_start = time.perf_counter()
+        tqdm.write("Preparing sparse BOSZ matrix")
+        self._ensure_S_log(sparse_tol, sparse_floor)
+        tqdm.write(
+            f"Sparse BOSZ matrix ready: shape={self.S_log.shape}, "
+            f"nnz={self.S_log.nnz:,}, elapsed={time.perf_counter() - stage_start:.1f}s"
+        )
+
+        rows = self._train_rows()
+        stage_start = time.perf_counter()
+        tqdm.write(f"Selecting {len(rows):,} training rows from sparse matrix")
+        tqdm.write(
+            f"[NMF] Gathering {len(self.train_rows) if self.train_rows is not None else self.S_log.shape[0]:,} "
+            "training rows into the fit matrix...",
+        )
+        row_start = time.perf_counter()
+        X = self.S_log if self.train_rows is None else self.S_log[self.train_rows]
+        tqdm.write(
+            f"[NMF] Fit matrix ready: shape={X.shape}, nnz={X.nnz:,} "
+            f"({time.perf_counter() - row_start:.1f}s)",
+        )
+        tqdm.write(
+            f"Training matrix ready: shape={X.shape}, nnz={X.nnz:,}, "
+            f"density={X.nnz / np.prod(X.shape):.2%}, "
+            f"selection_elapsed={time.perf_counter() - stage_start:.1f}s"
+        )
+        nmf_F = NMF(
+            n_components=self.K,
+            init=init,
+            solver="cd",
+            max_iter=max_iter,
+            tol=tol,
+            random_state=seed,
+            shuffle=True,
+            verbose=1,
+        )
+        tqdm.write(
+            f"Starting NMF initialization and coordinate descent "
+            f"(max_iter={max_iter}, init={init})"
+        )
+        stage_start = time.perf_counter()
+        fit_start = time.perf_counter()
+        tqdm.write(
+            "[NMF] Entering sklearn NMF.fit (initialization may take a while)...",
+        )
+        nmf_F.fit(X)
+        tqdm.write(
+            f"[NMF] NMF.fit finished ({time.perf_counter() - fit_start:.1f}s)",
+        )
+        tqdm.write(
+            f"NMF fit finished after {nmf_F.n_iter_} iterations, "
+            f"elapsed={time.perf_counter() - stage_start:.1f}s"
+        )
+        self._report_residuals(nmf_F, rows, residual_samples, seed)
+        self.F = nmf_F.components_
+        self._save_nmf(cache_dir, cache_name, params, self.F)
+
+    def fit_full(self, max_iter=10_000, seed=0, tol=0.0, init="nndsvda", sparse_tol=1e-2, sparse_floor=1e-10, residual_samples=20_000):
         """Compatibility wrapper for ``get_F(batch=False, ...)``."""
-        return self.get_F(
-            batch=False,
+        return self.get_F_full(
             max_iter=max_iter,
             seed=seed,
-            tol=tol,
-            init=init,
             sparse_tol=sparse_tol,
             sparse_floor=sparse_floor,
             residual_samples=residual_samples,
+            tol=tol,
+            init=init,
         )
 
     def get_G(self, max_iter=10_000, seed=0):
@@ -399,6 +513,21 @@ class ContinuumNormalizer:
         tmp_json.write_text(json.dumps(params, indent=2, sort_keys=True))
         os.replace(tmp_json, json_path)
 
+    @staticmethod
+    def _load_sparse_matrix_with_progress(npz_path):
+        """Load a cached sparse matrix while reporting bytes read from its NPZ file."""
+        file_size = npz_path.stat().st_size
+        with open(npz_path, "rb") as file:
+            with tqdm.wrapattr(
+                    file,
+                    "read",
+                    total=file_size,
+                    desc="Loading cached sparse matrix",
+                    unit="B",
+                    unit_scale=True,
+                ) as progress_file:
+                return sparse.load_npz(progress_file).tocsr()
+
     def get_sparse_S_log(self, tol=1e-2, floor=1e-10, chunk_size=1000, n_workers=None):
         """
         Builds the sparse -log(flux) matrix of the selected BOSZ spectra (float32 CSR, one row
@@ -419,8 +548,7 @@ class ContinuumNormalizer:
         if cache_dir is not None:
             npz_path, json_path = self._nmf_cache_paths(cache_dir, "sparse_S_log", params, ".npz")
             if json_path.is_file() and npz_path.is_file(): # json is written last
-                tqdm.write(f"Loading cached sparse matrix from {npz_path}")
-                self.S_log = sparse.load_npz(npz_path).tocsr()
+                self.S_log = self._load_sparse_matrix_with_progress(npz_path)
                 self._S_log_key = (float(tol), float(floor))
                 return
 
