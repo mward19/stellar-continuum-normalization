@@ -149,9 +149,16 @@ class ContinuumNormalizer:
         else:
             cached = self._load_nmf(cache_dir, cache_name, params)
         if cached is not None:
-            tqdm.write(f"Loaded cached F from {cache_dir}")
+            cache_path, _ = self._nmf_cache_paths(cache_dir, cache_name, params)
+            tqdm.write(f"Loaded cached F: {cache_path}")
             self.F = cached
         return cache_dir, cached
+
+    @classmethod
+    def _report_F_cache_path(cls, cache_dir, cache_name, params):
+        if cache_dir is not None:
+            cache_path, _ = cls._nmf_cache_paths(cache_dir, cache_name, params)
+            tqdm.write(f"Cached F: {cache_path}")
 
     def get_F_batch(
             self,
@@ -242,6 +249,7 @@ class ContinuumNormalizer:
         self._report_residuals(nmf_F, rows, residual_samples, seed)
         self.F = nmf_F.components_
         self._save_nmf(cache_dir, cache_name, params, self.F)
+        self._report_F_cache_path(cache_dir, cache_name, params)
 
     def get_F_full(
             self,
@@ -328,6 +336,7 @@ class ContinuumNormalizer:
         self._report_residuals(nmf_F, rows, residual_samples, seed)
         self.F = nmf_F.components_
         self._save_nmf(cache_dir, cache_name, params, self.F)
+        self._report_F_cache_path(cache_dir, cache_name, params)
 
     def fit_full(self, max_iter=10_000, seed=0, tol=0.0, init="nndsvda", sparse_tol=1e-2, sparse_floor=1e-10, residual_samples=20_000):
         """Compatibility wrapper for ``get_F(batch=False, ...)``."""
