@@ -17,6 +17,7 @@ if [[ -f "$output" ]] && [[ "$(stat -c %s "$output")" == "$expected_size" ]]; th
   exit 0
 fi
 
+# Keep partial downloads separate from the final grid file.
 temporary="$(mktemp "${output}.XXXXXX")"
 printf 'Downloading %s\n' "$filename"
 if ! curl --fail --location --retry 3 --output "$temporary" "${base_url}/${filename}"; then

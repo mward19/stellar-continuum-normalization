@@ -1,4 +1,5 @@
 """NMF artifact compatibility, integrity, and job naming without spectral data."""
+
 import hashlib
 import json
 import os
@@ -29,8 +30,14 @@ class NMFCacheTests(unittest.TestCase):
         self.wave = np.array([3800., 3901., 4200.])  # Deliberately not geomspace.
 
     def save(self, name='nmf_F_full', params=None, array=None, **kwargs):
-        return self.cache.save(name, self.array if array is None else array, self.wave,
-                params=self.params if params is None else params, role='stellar', **kwargs)
+        return self.cache.save(
+            name,
+            self.array if array is None else array,
+            self.wave,
+            params=self.params if params is None else params,
+            role='stellar',
+            **kwargs
+        )
 
     def test_job_filename_explicit_wave_and_roundtrip(self):
         os.environ['SLURM_JOB_ID'] = '15262808'
@@ -60,11 +67,14 @@ class NMFCacheTests(unittest.TestCase):
         self.assertEqual(first.name, 'nmf_F_full_123.npy')
         self.assertEqual(second.name, 'nmf_F_full_123_2.npy')
         checkpoint = self.save(name='nmf_F_last_epoch', artifact_kind='checkpoint')
-        again = self.save(name='nmf_F_last_epoch', artifact_kind='checkpoint', array=self.array+1)
+        again = self.save(name='nmf_F_last_epoch', artifact_kind='checkpoint', array=self.array + 1)
         self.assertEqual(checkpoint, again)
         with self.assertRaises(CacheValidationError):
             self.cache.load(checkpoint)
-        np.testing.assert_array_equal(self.cache.load(checkpoint, allow_checkpoint=True).basis, self.array+1)
+        np.testing.assert_array_equal(
+            self.cache.load(checkpoint, allow_checkpoint=True).basis,
+            self.array + 1
+        )
         with self.assertRaises(CacheMiss):
             self.cache.load(name='nmf_F', params=self.params)
 
@@ -105,11 +115,15 @@ class NMFCacheTests(unittest.TestCase):
             self.cache.load(path)
 
     def test_invalid_basis_or_grid_cannot_be_saved(self):
-        for array, wave in [(self.array-1, self.wave), (self.array, self.wave[::-1]),
-                             (self.array, self.wave[:2]), (self.array*np.nan, self.wave)]:
+        for array, wave in [
+            (self.array - 1, self.wave),
+            (self.array, self.wave[::-1]),
+            (self.array, self.wave[:2]),
+            (self.array * np.nan, self.wave)
+        ]:
             with self.assertRaises(CacheValidationError):
                 self.cache.save('bad', array, wave, params={}, role='stellar')
-        self.assertFalse((self.root/'bad.npy').exists())
+        self.assertFalse((self.root / 'bad.npy').exists())
 
     def test_legacy_grid_and_role_adapter(self):
         key = hashlib.sha1(json.dumps(self.params, sort_keys=True).encode()).hexdigest()[:10]
@@ -164,7 +178,7 @@ class NMFCacheTests(unittest.TestCase):
             self.cache.load_matrix(params, storage='dense')
 
     def test_auto_load_never_trains_or_creates_cache(self):
-        cache = NMFCache(self.root/'missing')
+        cache = NMFCache(self.root / 'missing')
         with self.assertRaises(CacheMiss):
             SpectralNMF.load(cache=cache, params={'training': {'solver': 'cd'}})
         self.assertFalse(cache.directory.exists())

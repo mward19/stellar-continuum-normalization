@@ -1,4 +1,5 @@
 """Versioned NMF artifacts, independent of training data and optimizers."""
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -83,6 +84,7 @@ class NMFCache:
     Constructors and lookups do not create directories. Saving uses a directory lock,
     atomic file replacements, checksums, and a JSON completion record written last.
     """
+
     def __init__(self, directory):
         self.directory = Path(directory)
 
@@ -106,6 +108,7 @@ class NMFCache:
     def _paths(self, name, params, suffix='.npy', *, use_job_id=True):
         if not re.fullmatch(r'[A-Za-z0-9_]+', name):
             raise ValueError('Cache name must contain only letters, numbers, and underscores')
+        # Matching parameters may reuse a filename; other configurations get a suffix.
         job_id = os.environ.get('SLURM_JOB_ID', '').strip()
         if use_job_id and suffix == '.npy' and re.fullmatch(r'[0-9]+', job_id):
             index = 1
@@ -142,12 +145,24 @@ class NMFCache:
                 writer(stream)
                 stream.flush()
                 os.fsync(stream.fileno())
+            # Replace only after the complete file has been flushed to disk.
             os.replace(temporary, path)
         finally:
             Path(temporary).unlink(missing_ok=True)
 
-    def save(self, name, basis, wavelengths, *, params, role, preprocessing=None,
-             source_manifest=None, diagnostics=None, artifact_kind='basis'):
+    def save(
+        self,
+        name,
+        basis,
+        wavelengths,
+        *,
+        params,
+        role,
+        preprocessing=None,
+        source_manifest=None,
+        diagnostics=None,
+        artifact_kind='basis'
+    ):
         if role not in ('stellar', 'telluric') or artifact_kind not in ('basis', 'checkpoint'):
             raise ValueError('Unknown role or artifact kind')
         basis, wavelengths = np.asarray(basis), np.asarray(wavelengths, dtype=np.float64)
@@ -163,19 +178,54 @@ class NMFCache:
             self._atomic(path, lambda f: np.save(f, basis, allow_pickle=False))
             self._atomic(wave_path, lambda f: np.save(f, wavelengths, allow_pickle=False))
             arrays = {}
-            for label, array, filename in [('basis', basis, path), ('wavelengths', wavelengths, wave_path)]:
-                arrays[label] = dict(filename=filename.name, shape=list(array.shape),
-                                     dtype=str(array.dtype), sha256=file_digest(filename))
-            metadata = dict(schema_version=SCHEMA_VERSION, artifact_kind=artifact_kind, role=role,
-                            params=params, arrays=arrays, preprocessing=preprocessing or {},
-                            source_manifest=source_manifest or {}, diagnostics=diagnostics or {},
-                            provenance=dict(created_utc=datetime.now(timezone.utc).isoformat(),
-                                slurm_job_id=os.environ.get('SLURM_JOB_ID'),
-                                thread_environment={key: os.environ.get(key) for key in
-                                    ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'SLURM_CPUS_PER_TASK', 'NMF_THREADS')},
-                                versions=dict(python=platform.python_version(), numpy=np.__version__,
-                                              scipy=scipy.__version__, sklearn=sklearn.__version__)))
-            payload = json.dumps(metadata, indent=2, sort_keys=True, default=_json_default, allow_nan=False).encode()
+            for label, array, filename in [
+                ('basis', basis, path),
+                ('wavelengths', wavelengths, wave_path)
+            ]:
+                arrays[label] = dict(
+                    filename=filename.name,
+                    shape=list(array.shape),
+                    dtype=str(array.dtype),
+                    sha256=file_digest(filename)
+                )
+            metadata = dict(
+                schema_version=SCHEMA_VERSION,
+                artifact_kind=artifact_kind,
+                role=role,
+                params=params,
+                arrays=arrays,
+                preprocessing=preprocessing or {},
+                source_manifest=source_manifest or {},
+                diagnostics=diagnostics or {},
+                provenance=dict(
+                    created_utc=datetime.now(timezone.utc).isoformat(),
+                    slurm_job_id=os.environ.get('SLURM_JOB_ID'),
+                    thread_environment={
+                        key: os.environ.get(key)
+                        for key in (
+                            'OMP_NUM_THREADS',
+                            'OPENBLAS_NUM_THREADS',
+                            'MKL_NUM_THREADS',
+                            'SLURM_CPUS_PER_TASK',
+                            'NMF_THREADS'
+                        )
+                    },
+                    versions=dict(
+                        python=platform.python_version(),
+                        numpy=np.__version__,
+                        scipy=scipy.__version__,
+                        sklearn=sklearn.__version__
+                    )
+                )
+            )
+            payload = json.dumps(
+                metadata,
+                indent=2,
+                sort_keys=True,
+                default=_json_default,
+                allow_nan=False
+            ).encode()
+            # The JSON sidecar is the completion record, so publish it last.
             self._atomic(sidecar, lambda f: f.write(payload))
         return path
 
@@ -199,13 +249,27 @@ class NMFCache:
                 grid = metadata['bosz' if saved_role == 'stellar' else 'telluric']
                 wave = np.geomspace(grid['wave_min'], grid['wave_max'], grid['D'])
                 basis = np.load(path, allow_pickle=False)
-                metadata = dict(schema_version=0, artifact_kind='basis', role=saved_role,
-                                params=saved_params, preprocessing=grid, source_manifest={}, diagnostics={},
-                                provenance=dict(legacy=True, wavelengths_inferred=True))
+                metadata = dict(
+                    schema_version=0,
+                    artifact_kind='basis',
+                    role=saved_role,
+                    params=saved_params,
+                    preprocessing=grid,
+                    source_manifest={},
+                    diagnostics={},
+                    provenance=dict(legacy=True, wavelengths_inferred=True)
+                )
             else:
                 if metadata['schema_version'] != SCHEMA_VERSION:
                     raise CacheValidationError(f'Unsupported artifact schema: {metadata["schema_version"]}')
-                for field in ('params', 'arrays', 'preprocessing', 'source_manifest', 'diagnostics', 'provenance'):
+                for field in (
+                    'params',
+                    'arrays',
+                    'preprocessing',
+                    'source_manifest',
+                    'diagnostics',
+                    'provenance'
+                ):
                     if not isinstance(metadata.get(field), dict):
                         raise CacheValidationError(f'Missing or invalid artifact field: {field}')
                 if metadata['role'] not in ('stellar', 'telluric') or (role is not None and metadata['role'] != role):
@@ -242,7 +306,12 @@ class NMFCache:
 
     def load(self, filepath=None, *, name=None, params=None, role=None, allow_checkpoint=False):
         if filepath is not None:
-            return self._read_artifact(filepath, role=role, params=params, allow_checkpoint=allow_checkpoint)
+            return self._read_artifact(
+                filepath,
+                role=role,
+                params=params,
+                allow_checkpoint=allow_checkpoint
+            )
         if name is None or params is None:
             raise ValueError('Cache search requires a name and complete matching parameters')
         failures = []
@@ -250,7 +319,12 @@ class NMFCache:
             if not path.is_file():
                 continue
             try:
-                return self._read_artifact(path, role=role, params=params, allow_checkpoint=allow_checkpoint)
+                return self._read_artifact(
+                    path,
+                    role=role,
+                    params=params,
+                    allow_checkpoint=allow_checkpoint
+                )
             except CacheValidationError as exc:
                 failures.append(str(exc))
         detail = f'; last rejection: {failures[-1]}' if failures else ''
@@ -267,7 +341,12 @@ class NMFCache:
         else:
             matrix = np.asarray(matrix)
             self._atomic(path, lambda f: np.save(f, matrix, allow_pickle=False))
-        metadata = dict(params=params, shape=list(matrix.shape), dtype=str(matrix.dtype), sha256=file_digest(path))
+        metadata = dict(
+            params=params,
+            shape=list(matrix.shape),
+            dtype=str(matrix.dtype),
+            sha256=file_digest(path)
+        )
         self._atomic(sidecar, lambda f: f.write(canonical(metadata).encode()))
         return path
 

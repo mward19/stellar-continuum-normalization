@@ -4,6 +4,7 @@
 usage: python run_downloads.py downloads.sh
 Requires: pip install tqdm
 """
+
 import shlex
 import subprocess
 import sys
@@ -31,14 +32,18 @@ def main(script: str, position: int = 0) -> None:
     skipped = 0
 
     with open(script) as f, open("failed_lines.txt", "a") as fail_log:
-        bar = tqdm(total=total, unit="file", leave=False, position=position,
-                   desc=Path(script).name)
+        bar = tqdm(
+            total=total,
+            unit="file",
+            leave=False,
+            position=position,
+            desc=Path(script).name
+        )
         for line in f:
             if not is_curl(line):
                 continue
 
-            # shlex.split respects the double quotes in your lines, so we can
-            # skip shell=True (no quoting/injection surprises).
+            # Parse arguments directly so curl runs without an intermediate shell.
             args = shlex.split(line)
 
             # Resumability: if --output target already exists and is non-empty,

@@ -31,7 +31,7 @@ def _(Path, TelluricSpectra):
         cache_dir=Path("/home/mward19/nobackup/autodelete/telluric/processed"),
     )
     wave = telluric.wave_out
-    telluric_matrix = telluric.M # -log(T), shape (5000, D)
+    telluric_matrix = telluric.M  # -log(T), shape (5000, D)
     telluric_matrix.shape
     return telluric_matrix, wave
 

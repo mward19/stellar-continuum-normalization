@@ -23,19 +23,21 @@ except ImportError:  # run as a script
     from wavelength import log_wavelength_grid
 
 
-@dataclass(frozen=True) # frozen so the ID can be hashed
+@dataclass(frozen=True)  # Immutable IDs can be used as cache keys.
 class SpectrumID:
-    atmos: str # model atmosphere
-    teff: str # effective temperature
-    logg: str # surface gravity
-    metal: str # solar metallicity
-    alpha: str # alpha element enrichment
-    carbon: str # carbon abundance
-    micro: str # microturbulence velocity
-    insbroad: str # instrumental broadening
-    prod: str # "type of product", whatever that means
+    atmos: str  # model atmosphere
+    teff: str  # effective temperature
+    logg: str  # surface gravity
+    metal: str  # solar metallicity
+    alpha: str  # alpha element enrichment
+    carbon: str  # carbon abundance
+    micro: str  # microturbulence velocity
+    insbroad: str  # instrumental broadening
+    prod: str  # BOSZ product type, such as noresam.
 
-_WORKER_SPECTRA = None # set before forking so workers can reach the instance
+
+_WORKER_SPECTRA = None  # set before forking so workers can reach the instance
+
 
 def _init_compute_worker():
     # Parallelism comes from processes here, rather than nested numerical threads.
@@ -45,25 +47,26 @@ def _init_compute_worker():
 def _compute_item(id):
     return id, _WORKER_SPECTRA._compute_spectrum(id)
 
+
 class BOSZSpectra:
     # Bump when the processing code changes (clip, NaN handling, ...) so that
     # caches made by older code are rejected instead of silently reused.
     PROCESSING_VERSION = 1
-    MAX_OPEN_MAPS = 64 # LRU of memory-mapped group files
+    MAX_OPEN_MAPS = 64  # LRU of memory-mapped group files
 
     def __init__(
-            self, 
-            root: Path, 
-            R_in, 
-            R_out, 
-            D=None, # None: choose samples_per_fwhm points per target resolution element
-            wave_min=None, 
-            wave_max=None,
-            cache_dir=None,
-            spectra_per_file=1000, # Number of spectra stored in each cached .npy file
-            debug_max_F_spectra=None,
-            samples_per_fwhm=3.0,
-        ):
+        self,
+        root: Path,
+        R_in,
+        R_out,
+        D=None,  # None: choose samples_per_fwhm points per target resolution element
+        wave_min=None,
+        wave_max=None,
+        cache_dir=None,
+        spectra_per_file=1000,  # Number of spectra stored in each cached .npy file
+        debug_max_F_spectra=None,
+        samples_per_fwhm=3.0,
+    ):
         self.root = root
         self.use_cache = cache_dir is not None
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
@@ -76,17 +79,17 @@ class BOSZSpectra:
         self.file_to_id = dict()
         self.id_to_file = dict()
 
-        # For convolution
+        # Instrumental broadening settings.
         self.R_in = R_in
         self.R_out = R_out
 
-        # For cropping
+        # Requested wavelength coverage.
         self.wave_min = wave_min
         self.wave_max = wave_max
 
         self.scan_root()
 
-        # If min or max not provided, use first spectrum to infer
+        # Infer missing bounds from the first raw spectrum.
         if self.wave_min is None or self.wave_max is None:
             spec_0 = self.raw_spectrum(self.ids[0])
             wave = spec_0[:, 0]
@@ -100,14 +103,18 @@ class BOSZSpectra:
         # Resolve D before opening the cache: equal output grids share cached flux.
         self.samples_per_fwhm = samples_per_fwhm
         self.wave_out = log_wavelength_grid(
-            self.wave_min, self.wave_max, D=D, resolving_power=self.R_out,
-            samples_per_fwhm=samples_per_fwhm)
+            self.wave_min,
+            self.wave_max,
+            D=D,
+            resolving_power=self.R_out,
+            samples_per_fwhm=samples_per_fwhm
+        )
         self.D = len(self.wave_out)
 
         # Cache: spectra waiting to be written to the next group file
-        self._pending = {} # SpectrumID -> processed spectrum
-        self._maps = OrderedDict() # cache_file -> np.memmap
-        self._locations = None # SpectrumID -> (cache_file, row_index), loaded on demand
+        self._pending = {}  # SpectrumID -> processed spectrum
+        self._maps = OrderedDict()  # cache_file -> np.memmap
+        self._locations = None  # SpectrumID -> (cache_file, row_index), loaded on demand
         if self.use_cache:
             self._open_cache()
             # Don't lose spectra computed ad hoc (e.g. via spectra[i]) at exit
@@ -153,7 +160,7 @@ class BOSZSpectra:
         raw_spectrum = self.raw_spectrum(id)
         wave = raw_spectrum[:, 0]
 
-        # normalized flux; NaNs allowed
+        # Normalize by the theoretical continuum before broadening the lines.
         with np.errstate(divide="ignore", invalid="ignore"):
             spectrum = raw_spectrum[:, 1] / raw_spectrum[:, 2]
 
@@ -315,7 +322,7 @@ class BOSZSpectra:
 
         self._next_index += 1
         self._pending.clear()
-        self._locations = None # stale now that rows were added
+        self._locations = None  # stale now that rows were added
 
     def _location_index(self):
         """
@@ -341,7 +348,7 @@ class BOSZSpectra:
             return None
         locations = self._location_index()
 
-        by_file = {} # cache_file -> (positions in the output, rows in the file)
+        by_file = {}  # cache_file -> (positions in the output, rows in the file)
         for position, id in enumerate(ids):
             location = locations.get(id)
             if location is None:
@@ -355,10 +362,10 @@ class BOSZSpectra:
             try:
                 data = np.load(self.cache_dir / cache_file, mmap_mode="r")
             except FileNotFoundError:
-                return None # index points at a missing file; caller recomputes
+                return None  # index points at a missing file; caller recomputes
             if out is None:
                 out = np.empty((len(ids), data.shape[1]), dtype=data.dtype)
-            order = np.argsort(rows) # ascending rows give sequential reads
+            order = np.argsort(rows)  # ascending rows give sequential reads
             out[np.asarray(positions)[order]] = data[np.asarray(rows)[order]]
         return out
 
@@ -371,7 +378,7 @@ class BOSZSpectra:
             try:
                 data = np.load(self.cache_dir / cache_file, mmap_mode="r")
             except FileNotFoundError:
-                return None # index points at a missing file; caller recomputes
+                return None  # index points at a missing file; caller recomputes
             self._maps[cache_file] = data
             if len(self._maps) > self.MAX_OPEN_MAPS:
                 self._maps.popitem(last=False)
@@ -384,9 +391,9 @@ class BOSZSpectra:
         files = list(self.root.glob(pattern))
         for file in tqdm(files, unit="file", desc="Parsing root directory"):
             id = self.id_from_path(file)
-            if id in self.id_to_file: # dict lookup; `in self.ids` (a list) is O(n^2)
+            if id in self.id_to_file:  # dict lookup; `in self.ids` (a list) is O(n^2)
                 raise ValueError(f"ID {id} was found twice in the dataset")
-            
+
             self.file_to_id[file] = id
             self.id_to_file[id] = file
             self.ids.append(id)
@@ -416,7 +423,7 @@ class BOSZSpectra:
             - Continuum
         """
         if is_path:
-            id = self.path_to_id[id] # Convert to SpectrumID
+            id = self.path_to_id[id]  # Convert to SpectrumID
 
         array = np.loadtxt(self.id_to_file[id], dtype=np.float32)
         return array
@@ -466,8 +473,12 @@ class BOSZSpectra:
 
         cached = set() if force_recompute else self._cached_ids()
         todo = [id for id in ids if id not in cached]
-        with tqdm(total=len(ids), initial=len(ids) - len(todo), unit='spectra',
-                  desc="Processing selected BOSZ flux") as progress:
+        with tqdm(
+            total=len(ids),
+            initial=len(ids) - len(todo),
+            unit='spectra',
+            desc="Processing selected BOSZ flux"
+        ) as progress:
             try:
                 if n_workers == 1:
                     for id in todo:
@@ -479,7 +490,9 @@ class BOSZSpectra:
                     _WORKER_SPECTRA = self
                     try:
                         with multiprocessing.get_context("fork").Pool(
-                                min(n_workers, len(todo)), initializer=_init_compute_worker) as pool:
+                            min(n_workers, len(todo)),
+                            initializer=_init_compute_worker
+                        ) as pool:
                             for id, spectrum in pool.imap_unordered(_compute_item, todo, chunksize=1):
                                 self._add_pending(id, spectrum)
                                 progress.update(1)
@@ -503,7 +516,7 @@ class BOSZSpectra:
         if self.use_cache:
             self._add_pending(id, spectrum)
 
-        return spectrum # corresponding wavelengths are in self.wave_out
+        return spectrum  # corresponding wavelengths are in self.wave_out
 
     def _add_pending(self, id, spectrum):
         # Written to disk once a full group has accumulated (or on flush_cache)

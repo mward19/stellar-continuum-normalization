@@ -1,11 +1,18 @@
 """Resolution-based sampling for constant-log-wavelength grids."""
+
 import math
 
 import numpy as np
 
 
-def log_wavelength_grid(wave_min, wave_max, *, D=None, resolving_power=None,
-                        samples_per_fwhm=3.0):
+def log_wavelength_grid(
+    wave_min,
+    wave_max,
+    *,
+    D=None,
+    resolving_power=None,
+    samples_per_fwhm=3.0
+):
     """Use explicit D, or sample the target resolution at three points per FWHM.
 
     At high resolving power R, an instrumental FWHM spans about 1/R in log

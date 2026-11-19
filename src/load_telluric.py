@@ -35,17 +35,17 @@ class TelluricSpectra:
     CACHE_NAME = "telluric_neglogT"
 
     def __init__(
-            self,
-            pca_file: Path,
-            D=None, # None: choose samples_per_fwhm points per resolution element
-            wave_min=None,
-            wave_max=None,
-            R_out=None, # None: keep the file's native resolution
-            n_pca=4, # number of PCA components used for the reconstruction
-            t_floor=1e-10, # transmission floor so that -log(T) stays finite
-            cache_dir=None,
-            samples_per_fwhm=3.0,
-        ):
+        self,
+        pca_file: Path,
+        D=None,  # None: choose samples_per_fwhm points per resolution element
+        wave_min=None,
+        wave_max=None,
+        R_out=None,  # None: keep the file's native resolution
+        n_pca=4,  # number of PCA components used for the reconstruction
+        t_floor=1e-10,  # transmission floor so that -log(T) stays finite
+        cache_dir=None,
+        samples_per_fwhm=3.0,
+    ):
         self.pca_file = Path(pca_file)
         self.wave_min = wave_min
         self.wave_max = wave_max
@@ -65,8 +65,12 @@ class TelluricSpectra:
         self.samples_per_fwhm = samples_per_fwhm
         resolution = self.R_in if self.R_out is None else self.R_out
         self.wave_out = log_wavelength_grid(
-            self.wave_min, self.wave_max, D=D, resolving_power=resolution,
-            samples_per_fwhm=samples_per_fwhm)
+            self.wave_min,
+            self.wave_max,
+            D=D,
+            resolving_power=resolution,
+            samples_per_fwhm=samples_per_fwhm
+        )
         self.D = len(self.wave_out)
 
         self.M = self._load_cache() if self.cache_dir is not None else None
@@ -93,7 +97,12 @@ class TelluricSpectra:
         basis = comp[1:self.n_pca + 1, sel]
 
         M = np.empty((len(coefs), self.D), dtype=np.float32)
-        for i in tqdm(range(len(coefs)), unit="spectrum", desc="Reconstructing telluric spectra", mininterval=10):
+        for i in tqdm(
+            range(len(coefs)),
+            unit="spectrum",
+            desc="Reconstructing telluric spectra",
+            mininterval=10
+        ):
             tau = np.clip(np.sinh(mean + coefs[i, :self.n_pca] @ basis), 0, None)
             T = np.exp(-tau)
             if self.R_out is not None:
@@ -140,7 +149,7 @@ class TelluricSpectra:
                 f"(cached, requested): {diff}. Use a different cache_dir or delete the cache."
             )
         if not npy_path.is_file():
-            return None # json is only written after the npy, so this means it was deleted
+            return None  # json is only written after the npy, so this means it was deleted
         return np.load(npy_path)
 
     def _save_cache(self):
@@ -165,15 +174,15 @@ class TelluricSpectra:
             ncomp = hdul[0].header.get("NCOMP")
             if ncomp is None:
                 raise ValueError(f"{self.pca_file} has no NCOMP keyword, so it isn't a PCA file")
-            comp = np.asarray(hdul[0].data, dtype=np.float64) # (ncomp + 1, n_wave); row 0 is the mean
+            comp = np.asarray(hdul[0].data, dtype=np.float64)  # (ncomp + 1, n_wave); row 0 is the mean
             wave = np.asarray(hdul[1].data, dtype=np.float64)
-            coefs = np.asarray(hdul[3].data, dtype=np.float64) # (n_spectra, ncomp)
+            coefs = np.asarray(hdul[3].data, dtype=np.float64)  # (n_spectra, ncomp)
         if self.n_pca > ncomp:
             raise ValueError(f"n_pca ({self.n_pca}) is more than the {ncomp} components in the file")
         return comp, wave, coefs
 
     def __getitem__(self, i):
-        return self.M[i] # -log(T); corresponding wavelengths are in self.wave_out
+        return self.M[i]  # -log(T); corresponding wavelengths are in self.wave_out
 
     def __len__(self):
         return len(self.M)

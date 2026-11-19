@@ -1,6 +1,8 @@
 """Selection and preparation of NMF inputs; no optimizers or inference here."""
+
 from dataclasses import asdict, dataclass
 import hashlib
+import os
 
 import numpy as np
 from scipy import sparse
@@ -62,6 +64,7 @@ def describe_bosz(spectra, selection=None, *, threshold=.01, floor=1e-10, matrix
     if matrix_format not in ('dense', 'sparse'):
         raise ValueError("matrix_format must be 'dense' or 'sparse'")
     rows = _limit_bosz_rows(spectra, _indices(len(spectra), selection))
+    # Row order is part of cache identity, not just membership in the selection.
     digest = hashlib.sha256()
     identifiers = [] if len(rows) <= 1000 else None
     for row in rows:
@@ -69,23 +72,45 @@ def describe_bosz(spectra, selection=None, *, threshold=.01, floor=1e-10, matrix
         digest.update(canonical(identifier).encode() + b'\n')
         if identifiers is not None:
             identifiers.append(identifier)
-    manifest = dict(kind='bosz', count=len(rows), ordered_ids_sha256=digest.hexdigest(), root=str(spectra.root))
+    manifest = dict(
+        kind='bosz',
+        count=len(rows),
+        ordered_ids_sha256=digest.hexdigest(),
+        root=str(spectra.root)
+    )
     # Preserve an inspectable selection for small runs, without huge basis sidecars for full grids.
     if identifiers is not None:
         manifest['ids'] = identifiers
-    preprocessing = dict(spectra._processing_params(), optical_depth_threshold=float(threshold),
-                         flux_floor=float(floor), optical_depth_dtype='float32', optical_depth_storage=matrix_format,
-                         preparation_version=PREPARATION_VERSION,
-                         wavelength_unit='Angstrom', wavelength_convention='vacuum', reference_frame='stellar_rest')
+    preprocessing = dict(
+        spectra._processing_params(),
+        optical_depth_threshold=float(threshold),
+        flux_floor=float(floor),
+        optical_depth_dtype='float32',
+        optical_depth_storage=matrix_format,
+        preparation_version=PREPARATION_VERSION,
+        wavelength_unit='Angstrom',
+        wavelength_convention='vacuum',
+        reference_frame='stellar_rest'
+    )
     return np.asarray(spectra.wave_out, dtype=np.float64), preprocessing, manifest, rows
 
 
 def describe_telluric(spectra, selection=None):
     rows = _indices(len(spectra.M), selection)
-    preprocessing = dict(spectra._params(), preparation_version=PREPARATION_VERSION,
-                         wavelength_unit='Angstrom', wavelength_convention='vacuum', reference_frame='observer')
+    preprocessing = dict(
+        spectra._params(),
+        preparation_version=PREPARATION_VERSION,
+        wavelength_unit='Angstrom',
+        wavelength_convention='vacuum',
+        reference_frame='observer'
+    )
     path = spectra.pca_file
-    manifest = dict(kind='pypeit', count=len(rows), rows_sha256=array_digest(rows), source=str(path))
+    manifest = dict(
+        kind='pypeit',
+        count=len(rows),
+        rows_sha256=array_digest(rows),
+        source=str(path)
+    )
     if path.is_file():
         stat = path.stat()
         manifest.update(source_size=stat.st_size, source_mtime_ns=stat.st_mtime_ns)
@@ -116,22 +141,42 @@ def describe_matrix(matrix, wavelengths, *, preprocessing=None, source_ids=None,
         if len(source_ids) != matrix.shape[0]:
             raise ValueError('source_ids must have one entry per training row')
         manifest['ids'] = [source_ids[int(row)] for row in rows]
-    settings = {'wavelength_unit': 'Angstrom', 'wavelength_convention': 'unspecified',
-                'reference_frame': 'unspecified', **(preprocessing or {})}
+    settings = {
+        'wavelength_unit': 'Angstrom',
+        'wavelength_convention': 'unspecified',
+        'reference_frame': 'unspecified',
+        **(preprocessing or {})
+    }
     return wave, settings, manifest, rows
 
 
-def prepare_bosz(spectra, selection=None, *, threshold=.01, floor=1e-10,
-                 chunk_size=1000, n_workers=1, matrix_cache=None, matrix_format='dense'):
+def prepare_bosz(
+    spectra,
+    selection=None,
+    *,
+    threshold=.01,
+    floor=1e-10,
+    chunk_size=1000,
+    n_workers=1,
+    matrix_cache=None,
+    matrix_format='dense'
+):
     """Build selected optical depths as float32, dense by default or explicitly CSR.
 
     Workers prepare missing processed flux first. Dense assembly fills one final
     training array, rather than retaining chunks and concatenating another copy.
     """
+    if n_workers is None:
+        n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", len(os.sched_getaffinity(0))))
     if threshold < 0 or not 0 < floor <= 1 or chunk_size < 1 or n_workers < 1:
         raise ValueError('Invalid optical-depth preparation or worker settings')
     wave, settings, manifest, rows = describe_bosz(
-        spectra, selection, threshold=threshold, floor=floor, matrix_format=matrix_format)
+        spectra,
+        selection,
+        threshold=threshold,
+        floor=floor,
+        matrix_format=matrix_format
+    )
     params = dict(preprocessing=settings, source_manifest=manifest)
     cache = matrix_cache if isinstance(matrix_cache, NMFCache) else NMFCache(matrix_cache) if matrix_cache is not None else None
     if cache is not None:
@@ -148,6 +193,8 @@ def prepare_bosz(spectra, selection=None, *, threshold=.01, floor=1e-10,
             raise ValueError('Parallel BOSZ preparation requires a cache_dir')
         # Compute only missing selected flux in workers; the parent owns all cache writes.
         spectra.process_spectra([spectra.ids[int(i)] for i in rows], n_workers=n_workers)
+
+    # Dense mode fills one allocation; only sparse mode retains CSR chunks.
     matrix = np.empty((len(rows), len(wave)), dtype=np.float32) if matrix_format == 'dense' else None
     chunks = []
     if matrix is not None:
@@ -155,7 +202,12 @@ def prepare_bosz(spectra, selection=None, *, threshold=.01, floor=1e-10,
     with tqdm(total=len(rows), desc='Preparing selected BOSZ spectra', unit='spectrum') as progress:
         for start in range(0, len(rows), chunk_size):
             batch = rows[start:start + chunk_size]
-            optical_depth = spectra.optical_depth(batch, tol=threshold, floor=floor, progress=progress.update)
+            optical_depth = spectra.optical_depth(
+                batch,
+                tol=threshold,
+                floor=floor,
+                progress=progress.update
+            )
             if matrix is not None:
                 # Assignment casts only this batch; no intermediate sparse matrix is built.
                 matrix[start:start + len(batch)] = optical_depth

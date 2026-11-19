@@ -3,6 +3,7 @@
 Training and artifact persistence live in nmf.py and nmf_cache.py. Public classes
 are re-exported here so callers can import the complete API from src.model.
 """
+
 from dataclasses import dataclass
 import warnings
 
@@ -53,6 +54,7 @@ class ContinuumResponseBasis:
     on each full order before any bad-pixel masking. The default is the paper's
     Fourier prescription, including its original absolute-wavelength phase.
     """
+
     def __init__(self, n_modes=9, *, basis_function=None):
         if not isinstance(n_modes, (int, np.integer)) or n_modes < 1:
             raise ValueError('n_modes must be a positive integer')
@@ -69,7 +71,7 @@ class ContinuumResponseBasis:
         basis = np.empty((len(wave), n_modes))
         # Preserve the original arithmetic order: tiny phase changes can affect ill-conditioned fits.
         for j in range(1, n_modes + 1):
-            basis[:, j-1] = np.cos(np.pi*(j-1)/period*wave) if j % 2 else np.sin(np.pi*j/period*wave)
+            basis[:, j - 1] = np.cos(np.pi * (j - 1) / period * wave) if j % 2 else np.sin(np.pi * j / period * wave)
         return basis
 
     def design_matrix(self, order_wavelengths):
@@ -122,6 +124,7 @@ class ContinuumNormalizer:
     variance_order=1 preserves the previous weighting; 2 selects the paper's
     second-order approximation explicitly. No instrumental broadening is applied.
     """
+
     def __init__(self, stellar, telluric=None, response_basis=None, *, variance_order=1):
         if not isinstance(stellar, SpectralNMF):
             raise TypeError('stellar must be a fitted SpectralNMF; call fit() or load() first')
@@ -158,8 +161,18 @@ class ContinuumNormalizer:
     def telluric_wave_out(self):
         return None if self.telluric is None else self.telluric.wavelengths
 
-    def fit(self, wavelengths, flux=None, flux_errors=None, *, rv=0., mask=None, tol=1e-10,
-            lsq_solver='lsmr', max_iter=None):
+    def fit(
+        self,
+        wavelengths,
+        flux=None,
+        flux_errors=None,
+        *,
+        rv=0.,
+        mask=None,
+        tol=1e-10,
+        lsq_solver='lsmr',
+        max_iter=None
+    ):
         """Fit one observation. True in mask means retain; outputs preserve input order shapes.
 
         Nonpositive/nonfinite flux/errors and wavelengths outside basis coverage are
@@ -175,14 +188,17 @@ class ContinuumNormalizer:
             raise ValueError('Provide wavelengths, flux, and flux_errors for this observation')
         if lsq_solver not in ('lsmr', 'exact'):
             raise ValueError("lsq_solver must be 'lsmr' or 'exact'")
-        if not np.isfinite(rv) or 1 + rv/C_KMS <= 0:
+        if not np.isfinite(rv) or 1 + rv / C_KMS <= 0:
             raise ValueError('Invalid observed-frame radial velocity')
+        # Flatten orders for the solve; pack() restores their original shapes.
         wave_orders, flux_orders, error_orders = map(_orders, (wavelengths, flux, flux_errors))
         lengths = [len(order) for order in wave_orders]
         if [len(order) for order in flux_orders] != lengths or [len(order) for order in error_orders] != lengths:
             raise ValueError('Wavelengths, flux and errors must have matching order shapes')
         wave, observed, errors = map(np.concatenate, (wave_orders, flux_orders, error_orders))
-        rest_wave = wave/(1 + rv/C_KMS)
+
+        # Stellar absorption uses rest wavelengths; tellurics stay in the observer frame.
+        rest_wave = wave / (1 + rv / C_KMS)
         good = np.isfinite(wave) & np.isfinite(observed) & np.isfinite(errors) & (observed > 0) & (errors > 0)
         good &= (rest_wave >= self.stellar.wavelengths[0]) & (rest_wave <= self.stellar.wavelengths[-1])
         if self.telluric is not None:
@@ -197,31 +213,52 @@ class ContinuumNormalizer:
             good &= flat_mask.astype(bool)
         if not good.any():
             raise ValueError('No usable pixels remain after masking and coverage checks')
+
+        # Evaluate continuum modes on full orders before applying the pixel mask.
         H = self.response_basis.design_matrix(wavelengths)[good]
         F = self.stellar.evaluate(rest_wave[good]).T
         G = self.telluric.evaluate(wave[good]).T if self.telluric is not None else np.empty((good.sum(), 0))
-        ratio = (errors[good]/observed[good])**2
-        weight = 1/np.sqrt(ratio + .5*ratio**2) if self.variance_order == 2 else observed[good]/errors[good]
+        ratio = (errors[good] / observed[good])**2
+        weight = 1 / np.sqrt(ratio + .5 * ratio**2) if self.variance_order == 2 else observed[good] / errors[good]
         A = sparse.hstack([sparse.csr_matrix(-F), sparse.csr_matrix(-G), H], format='csr')
         weighted_A = sparse.diags(weight) @ A
         K, L = F.shape[1], G.shape[1]
-        lower = np.r_[np.zeros(K+L), np.full(H.shape[1], -np.inf)]
+
+        # Absorption weights are nonnegative; continuum coefficients are unbounded.
+        lower = np.r_[np.zeros(K + L), np.full(H.shape[1], -np.inf)]
         solve_matrix = weighted_A.toarray() if lsq_solver == 'exact' else weighted_A
-        solved = lsq_linear(solve_matrix, weight*np.log(observed[good]), bounds=(lower, np.inf),
-                            method='trf', lsq_solver=lsq_solver, tol=tol, max_iter=max_iter)
-        alpha, beta, gamma = solved.x[:K], solved.x[K:K+L], solved.x[K+L:]
+        solved = lsq_linear(
+            solve_matrix,
+            weight * np.log(observed[good]),
+            bounds=(lower, np.inf),
+            method='trf',
+            lsq_solver=lsq_solver,
+            tol=tol,
+            max_iter=max_iter
+        )
+        alpha, beta, gamma = solved.x[:K], solved.x[K:K + L], solved.x[K + L:]
         stellar_flux = np.exp(-F @ alpha)
         telluric_transmission = np.exp(-G @ beta)
         continuum = np.exp(H @ gamma)
+
         def pack(values):
             full = np.full(len(wave), np.nan)
             full[good] = values
             return _restore(full, wavelengths, wave_orders)
-        return ContinuumFitResult(alpha=alpha, beta=beta,
-                gamma=gamma.reshape(len(wave_orders), self.response_basis.n_modes), wavelengths=wavelengths,
-                continuum=pack(continuum), stellar_flux=pack(stellar_flux),
-                telluric_transmission=pack(telluric_transmission), model_flux=pack(np.exp(A @ solved.x)),
-                rectified_flux=pack(observed[good]/continuum), mask=_restore(good, wavelengths, wave_orders), solver_result=solved)
+
+        return ContinuumFitResult(
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma.reshape(len(wave_orders), self.response_basis.n_modes),
+            wavelengths=wavelengths,
+            continuum=pack(continuum),
+            stellar_flux=pack(stellar_flux),
+            telluric_transmission=pack(telluric_transmission),
+            model_flux=pack(np.exp(A @ solved.x)),
+            rectified_flux=pack(observed[good] / continuum),
+            mask=_restore(good, wavelengths, wave_orders),
+            solver_result=solved
+        )
 
     @classmethod
     def from_cache(cls, F_path, G_path=None, flux_errors=None, order_wavelengths=None, n_modes=9):
@@ -231,7 +268,11 @@ class ContinuumNormalizer:
         if flux_errors is not None or order_wavelengths is not None:
             if flux_errors is None or order_wavelengths is None:
                 raise ValueError('Legacy observation defaults require wavelengths and errors together')
-            warnings.warn('Pass wavelengths and flux_errors to fit() instead of from_cache()', DeprecationWarning, stacklevel=2)
+            warnings.warn(
+                'Pass wavelengths and flux_errors to fit() instead of from_cache()',
+                DeprecationWarning,
+                stacklevel=2
+            )
             model._legacy_observation = (order_wavelengths, flux_errors)
         return model
 
@@ -285,11 +326,11 @@ def read_harps_s1d(path, wave_min, wave_max, barycentric=False):
 
     with fits.open(path) as hdul:
         header = hdul[0].header
-        if hdul[0].data is not None: # DRS image: wavelength grid is in the WCS keywords
+        if hdul[0].data is not None:  # DRS image: wavelength grid is in the WCS keywords
             flux = np.asarray(hdul[0].data, dtype=np.float64)
             wave = header["CRVAL1"] + header["CDELT1"] * np.arange(len(flux))
             flux_err = None
-        else: # table with WAVE, FLUX and ERR columns
+        else:  # table with WAVE, FLUX and ERR columns
             table = hdul[1].data
             wave = np.asarray(table["WAVE"], dtype=np.float64).ravel()
             flux = np.asarray(table["FLUX"], dtype=np.float64).ravel()

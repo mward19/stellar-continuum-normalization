@@ -1,4 +1,5 @@
 """Run with: uv run --with pytest pytest tests/test_load_telluric.py --basetemp ~/nobackup/autodelete/tmp/codex/pytest"""
+
 from pathlib import Path
 
 import numpy as np
@@ -8,7 +9,10 @@ from astropy.io import fits
 from src.load_telluric import TelluricSpectra
 
 PCA_FILE = Path("~/nobackup/autodelete/telluric/TellPCA_3000_10500_R120000.fits").expanduser()
-pytestmark = pytest.mark.skipif(not PCA_FILE.is_file(), reason="run scripts/download_telluric.sh first")
+pytestmark = pytest.mark.skipif(
+    not PCA_FILE.is_file(),
+    reason="run scripts/download_telluric.sh first"
+)
 
 KW = dict(D=3000, wave_min=3000, wave_max=7000, R_out=115_000, n_pca=4)
 
@@ -51,18 +55,25 @@ def test_matches_direct_reconstruction():
 def test_convolution_smooths(tell):
     raw = TelluricSpectra(PCA_FILE, D=3000, wave_min=3000, wave_max=7000, R_out=None, n_pca=4)
     assert not np.array_equal(raw.M, tell.M)
-    assert np.mean(np.abs(raw.M - tell.M)) < 0.05 # a small change: 120k -> 115k
+    assert np.mean(np.abs(raw.M - tell.M)) < 0.05  # a small change: 120k -> 115k
 
 
 def test_cache_reload_matches(tell, cache_dir):
     again = TelluricSpectra(PCA_FILE, cache_dir=cache_dir, **KW)
     assert np.array_equal(again.M, tell.M)
-    assert sorted(p.name for p in cache_dir.iterdir()) == ["telluric_neglogT.json", "telluric_neglogT.npy"]
+    assert sorted(p.name for p in cache_dir.iterdir()) == [
+        "telluric_neglogT.json",
+        "telluric_neglogT.npy"
+    ]
 
 
 @pytest.mark.parametrize("change", [
-    dict(D=2000), dict(wave_min=3100), dict(wave_max=6900), dict(R_out=100_000),
-    dict(n_pca=5), dict(t_floor=1e-6),
+    dict(D=2000),
+    dict(wave_min=3100),
+    dict(wave_max=6900),
+    dict(R_out=100_000),
+    dict(n_pca=5),
+    dict(t_floor=1e-6),
 ])
 def test_param_change_raises(tell, cache_dir, change):
     with pytest.raises(ValueError, match="differ"):

@@ -1,47 +1,57 @@
+"""Fit the HARPS stellar NMF basis from the prepared matrix cache."""
 import argparse
 import os
-from pathlib import Path
 
 from threadpoolctl import threadpool_limits
 
-from src.load_spectra import BOSZSpectra
-from src.model import SpectralNMF
-from src.preparation import select_bosz
+from src.nmf import PreparedSpectra
+from src.nmf_cache import CacheMiss
+from harps import BASIS_CACHE, load_harps_training_data, prepared_matrix_params
 
-parser = argparse.ArgumentParser(description="Train the HARPS stellar NMF basis")
-parser.add_argument("--matrix-format", choices=("dense", "sparse"), default="dense",
-                    help="Training matrix representation (default: dense float32)")
+
+parser = argparse.ArgumentParser(description="Fit the HARPS stellar NMF basis")
+parser.add_argument(
+    "--matrix-format",
+    choices=("dense", "sparse"),
+    default="dense",
+    help="Prepared matrix representation (default: dense float32)"
+)
+parser.add_argument(
+    "--row-stride",
+    type=int,
+    default=1,
+    help="Keep every n-th MARCS grid spectrum; must match preprocessing (default: 1)",
+)
 args = parser.parse_args()
+if args.row_stride < 1:
+    parser.error("--row-stride must be positive")
 
-HOME_DIR = Path('/home/mward19')
-
-print("Beginning processing")
-
-spectra = BOSZSpectra(
-    root=HOME_DIR / Path("nobackup/autodelete/bosz-spectra/data"),
-    R_in=300_000,
-    R_out=115_000,
-    D=None,  # Automatically sample R_out at three points per FWHM.
-    wave_min=3800,
-    wave_max=4200,
-    # debug_max_F_spectra=1000,
-    cache_dir=HOME_DIR / Path("nobackup/autodelete/bosz-spectra/processed-harps/cache"),
+spectra, selection, stellar, matrix_cache = load_harps_training_data(
+    args.matrix_format, row_stride=args.row_stride
 )
-selection = select_bosz(spectra)  # MARCS atmospheres, Teff <= 8000 K, capped by debug limit.
-print(f"Selected {len(selection):,} spectra for NMF", flush=True)
+params = prepared_matrix_params(spectra, selection, stellar)
+try:
+    matrix = matrix_cache.load_matrix(params, storage=args.matrix_format)
+except CacheMiss as exc:
+    raise SystemExit(
+        f"Prepared {args.matrix_format} HARPS matrix is missing from {matrix_cache.directory}. "
+        "Run sbatch runs/preprocess_harps.sh first with the same --matrix-format."
+    ) from exc
 
-stellar = SpectralNMF(
-    n_components=16, max_iter=500, tol=1e-4, sparse_tol=0.0,
-    matrix_format=args.matrix_format, verbose=1,
+prepared = PreparedSpectra(
+    optical_depth=matrix,
+    wavelengths=spectra.wave_out,
+    preprocessing=params['preprocessing'],
+    source_manifest=params['source_manifest'],
 )
-allocated_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
-n_workers = min(64, allocated_cpus)
-nmf_threads = min(allocated_cpus, int(os.environ.get("NMF_THREADS", "8")))
-if min(n_workers, nmf_threads) < 1:
-    raise ValueError("CPU allocation and NMF_THREADS must be positive")
-print(f"Preparing spectra with {n_workers} workers; NMF uses {nmf_threads} numerical threads "
-      f"and {args.matrix_format} storage", flush=True)
+nmf_threads = int(os.environ.get("NMF_THREADS", "16"))
+print(
+    f"Fitting {len(selection):,} spectra (row stride {args.row_stride}) "
+    f"from {matrix_cache.directory} "
+    f"with {args.matrix_format} storage and {nmf_threads} numerical threads",
+    flush=True
+)
 with threadpool_limits(limits=nmf_threads):
-    stellar.fit(spectra, selection=selection, cache="cache/stellar", n_workers=n_workers)
+    stellar.fit(prepared, cache=BASIS_CACHE)
 print(stellar.cache_path)
 print(stellar.diagnostics)

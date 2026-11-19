@@ -10,6 +10,7 @@ SCRIPTS_DIR = Path("./scripts")
 DOWNLOAD_DIR = Path("./data")
 MAX_WORKERS = 16
 
+# Resolve script paths before changing to the download directory.
 all_scripts = [p.resolve() for p in SCRIPTS_DIR.iterdir()]
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)

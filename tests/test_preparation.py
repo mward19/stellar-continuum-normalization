@@ -1,4 +1,5 @@
 """Parallel BOSZ preparation with real temporary spectra and cache files."""
+
 import gzip
 import os
 from pathlib import Path
@@ -38,16 +39,23 @@ class ParallelPreparationTests(unittest.TestCase):
         self.root.mkdir()
         wave = np.geomspace(3790., 4210., 2000)
         for i in range(7):
-            name = f'bosz2024_mp_t{5000+250*i}_g+4.0_m+0.00_a+0.00_c+0.00_v1_rorig_noresam.txt.gz'
-            flux = 1 - (.1 + .05*i)*np.exp(-.5*((wave - 4000.)/2.)**2)
+            name = f'bosz2024_mp_t{5000 + 250 * i}_g+4.0_m+0.00_a+0.00_c+0.00_v1_rorig_noresam.txt.gz'
+            flux = 1 - (.1 + .05 * i) * np.exp(-.5 * ((wave - 4000.) / 2.)**2)
             with gzip.open(self.root / name, 'wt') as handle:
                 np.savetxt(handle, np.column_stack([wave, flux, np.ones_like(wave)]))
 
     def loader(self, cache, limit=3):
-        loader = _TrackedBOSZ(self.root, R_in=300000, R_out=115000, D=120,
-                              wave_min=3800., wave_max=4200.,
-                              cache_dir=self.directory / cache, spectra_per_file=2,
-                              debug_max_F_spectra=limit)
+        loader = _TrackedBOSZ(
+            self.root,
+            R_in=300000,
+            R_out=115000,
+            D=120,
+            wave_min=3800.,
+            wave_max=4200.,
+            cache_dir=self.directory / cache,
+            spectra_per_file=2,
+            debug_max_F_spectra=limit
+        )
         # File discovery order is unspecified; fix it for the selection assertions.
         loader.ids.sort(key=lambda identifier: identifier.teff)
         loader.owner_pid = os.getpid()
@@ -84,7 +92,10 @@ class ParallelPreparationTests(unittest.TestCase):
         reloaded = self.loader('parallel')
         cached = prepare_bosz(reloaded, selection, threshold=0., n_workers=2)
         np.testing.assert_array_equal(cached.optical_depth, expected.optical_depth)
-        self.assertEqual(logs, {path.name: path.read_text() for path in reloaded.computation_log.iterdir()})
+        self.assertEqual(
+            logs,
+            {path.name: path.read_text() for path in reloaded.computation_log.iterdir()}
+        )
 
     def test_bulk_processing_still_obeys_debug_limit(self):
         loader = self.loader('bulk', limit=2)

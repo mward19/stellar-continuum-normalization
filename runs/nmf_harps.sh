@@ -1,19 +1,20 @@
 #!/bin/bash
 
-#SBATCH --time=48:00:00   # walltime
-#SBATCH --ntasks=1   # number of processor cores (i.e. tasks)
-#SBATCH --cpus-per-task=64
-#SBATCH --nodes=1   # number of nodes
-#SBATCH --mem=256G   # total memory; independent of CPU count
-#SBATCH --job-name=spectral_NMF_marcs
+#SBATCH --time=24:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --nodes=1
+#SBATCH --partition=m12
+#SBATCH --mem=512G
+#SBATCH --job-name=nmf_harps
 #SBATCH --output=./logs/%x_%j.out
 #SBATCH --error=./logs/%x_%j.err
 
-# Use processes for raw spectra. The Python script sets NMF threads separately.
+# Coordinate descent benefits from a moderate numerical thread count.
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-export NMF_THREADS=${NMF_THREADS:-8}
+export NMF_THREADS=${NMF_THREADS:-16}
 export PYTHONUNBUFFERED=1
 
 uv run ./runs/nmf_harps.py "$@"

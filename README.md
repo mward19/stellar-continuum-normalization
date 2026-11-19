@@ -134,25 +134,40 @@ preparation requires a processed-spectrum `cache_dir`; the parent process alone 
 that cache, and subsequent runs reuse it. The worker count controls preparation, while
 NMF numerical libraries use their own thread settings.
 
-[runs/nmf_harps.sh](runs/nmf_harps.sh) requests **64 CPUs, 256 GiB total memory, and
-48 hours** on one node. [runs/nmf_harps.py](runs/nmf_harps.py) uses up to 64 workers from
-`SLURM_CPUS_PER_TASK` for missing raw spectra. Each worker uses one numerical thread;
-cache writes and dense matrix assembly stay in the parent process. Reading compressed
-files and writing the shared cache may limit scaling below 64 workers.
+### Full HARPS training jobs
 
-NMF defaults to **eight numerical threads**, independent of the preprocessing worker
-count. Override with, for example, `NMF_THREADS=16 sbatch runs/nmf_harps.sh`; more threads
-are not guaranteed to be faster. The run retains `debug_max_F_spectra=1000` for testing.
-Set that argument to `None` in the run script for the full filtered selection. At the
-current wavelength grid, 396,108 dense float32 training rows occupy about 51 GiB before
-solver overhead. Choose storage at submission time:
+The production HARPS configuration is in [runs/harps.py](runs/harps.py). It selects all
+396,108 BOSZ MARCS spectra with `mp` or `ms` atmospheres and `Teff <= 8000 K` (row stride 1).
+The BOSZ grid is normalized by its theoretical continuum and convolved from `R_in=300000` to
+`R_out=115000`. It covers 3000–7000 Å on a logarithmic grid with three samples per resolution
+element (`D=292319`). Training uses 16 NMF components, coordinate descent, `max_iter=10000`,
+`tol=1e-4`, and `sparse_tol=0.0` so weak absorption is retained.
+
+Run preprocessing and NMF as separate Slurm jobs, in this order. Submit from the repository
+root; create the log directory first:
 
 ```bash
-sbatch runs/nmf_harps.sh --matrix-format dense   # default
-sbatch runs/nmf_harps.sh --matrix-format sparse
+mkdir -p logs
+sbatch runs/preprocess_harps.sh
+sbatch runs/nmf_harps.sh
 ```
 
-The selected format is saved in model parameters and restored by `.load()`.
+Both jobs request the `m12` partition and 512G of RAM. Preprocessing uses 128 CPUs and has a
+48-hour limit; it caches the processed spectra and builds the dense float32 optical-depth
+matrix. NMF uses 16 CPUs (16 numerical threads by default) and has a 24-hour limit; it loads
+the prepared matrix and saves the fitted basis. `--matrix-format` and `--row-stride` must
+match between jobs; their defaults are `dense` and `1`. For example, use
+`--row-stride 3` on both only if you intend to train on every third selected spectrum.
+The NMF job checks for the matching prepared matrix and exits if preprocessing has not
+produced it. To change its thread count, use `NMF_THREADS=8 sbatch runs/nmf_harps.sh`.
+
+At full selection, the prepared matrix is about **431 GiB** before overhead. The processed
+spectra cache is also about **431 GiB**, so allow roughly **862 GiB** across the two cache
+locations, plus temporary and raw data. The processed flux cache is stored at
+`/home/mward19/nobackup/autodelete/bosz-spectra/processed-harps/cache-high-res`; the prepared
+matrix and fitted basis are stored in the repository under
+`cache-high-res/harps_prepared` and `cache-high-res/stellar`, respectively. The paths are
+defined in `runs/harps.py`.
 
 For coordinate-descent NMF, reconstruction diagnostics reuse the weights learned during
 training (`residual_weight_source="training_fit"`). They do not launch another iterative
@@ -335,8 +350,8 @@ mkdir -p logs
 sbatch compute_F.sh
 ```
 
-The production script still uses `D=3000` across 3000–7000 Å, which undersamples HARPS lines.
-Use the subset notebook to validate finer sampling before creating a new production cache.
+`construct_big_nmf.py` still uses `D=3000` across 3000–7000 Å, which undersamples HARPS
+lines. Use the subset notebook to validate finer sampling before creating a new production cache.
 The provisional `R_in=300000` assumption also needs checking against native BOSZ resolution.
 The saved subset results still show substantial continuum errors for cool stars.
 

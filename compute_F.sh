@@ -9,9 +9,10 @@
 #SBATCH --output=./logs/%x_%j.out
 #SBATCH --error=./logs/%x_%j.err
 
-# Set the max number of threads to use for programs using OpenMP. Should be <= ppn. Does nothing if the program doesn't use OpenMP.
+# Set OpenMP threads from the node-level CPU count.
+# The Python program runs once; numerical libraries handle threading.
 export OMP_NUM_THREADS=$SLURM_CPUS_ON_NODE
 export PYTHONUNBUFFERED=1
 
-# LOAD MODULES, INSERT CODE, AND RUN YOUR PROGRAMS HERE
+# Train or load the production stellar and telluric bases.
 uv run construct_big_nmf.py

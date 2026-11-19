@@ -1,4 +1,5 @@
 """Automatic resolution sampling and compatibility with explicit-grid caches."""
+
 import gzip
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -28,8 +29,13 @@ class WavelengthGridTests(unittest.TestCase):
         expected = np.geomspace(3800, 4200, 123)
         for resolution, sampling in [(115000, 3), (120000, 4)]:
             np.testing.assert_array_equal(
-                log_wavelength_grid(3800, 4200, D=123, resolving_power=resolution,
-                                    samples_per_fwhm=sampling), expected)
+                log_wavelength_grid(
+                    3800,
+                    4200,
+                    D=123,
+                    resolving_power=resolution,
+                    samples_per_fwhm=sampling
+                ), expected)
         self.assertEqual(len(log_wavelength_grid(3800, 4200, D=np.int64(123))), 123)
 
     def test_finer_sampling_is_configurable(self):
@@ -41,8 +47,15 @@ class WavelengthGridTests(unittest.TestCase):
         for D in [0, 1, True, np.bool_(True), 3.5]:
             with self.subTest(D=D), self.assertRaises(ValueError):
                 log_wavelength_grid(3800, 4200, D=D)
-        for bounds in [(0, 4200), (-1, 4200), (4200, 3800), (3800, 3800),
-                       (np.nan, 4200), (3800, np.inf), (None, 4200)]:
+        for bounds in [
+            (0, 4200),
+            (-1, 4200),
+            (4200, 3800),
+            (3800, 3800),
+            (np.nan, 4200),
+            (3800, np.inf),
+            (None, 4200)
+        ]:
             with self.subTest(bounds=bounds), self.assertRaises(ValueError):
                 log_wavelength_grid(*bounds, D=100)
 
@@ -63,19 +76,29 @@ class LoaderGridTests(unittest.TestCase):
         self.raw = self.root / 'raw'
         self.raw.mkdir()
         wave = np.geomspace(3790., 4210., 2000)
-        tau = .2 * np.exp(-.5*((wave - 4000)/3)**2)
+        tau = .2 * np.exp(-.5 * ((wave - 4000) / 3)**2)
         filename = self.raw / 'bosz2024_mp_t6000_g+4.0_m+0.00_a+0.00_c+0.00_v1_rorig_noresam.txt.gz'
         with gzip.open(filename, 'wt') as stream:
             np.savetxt(stream, np.column_stack([wave, np.exp(-tau), np.ones_like(wave)]))
         self.pca = self.root / 'TellPCA_3000_10500_R120000.fits'
         components = fits.PrimaryHDU(np.stack([np.arcsinh(tau), np.zeros_like(tau)]))
         components.header['NCOMP'] = 1
-        fits.HDUList([components, fits.ImageHDU(wave), fits.ImageHDU(),
-                      fits.ImageHDU(np.array([[0.], [.1]]))]).writeto(self.pca)
+        fits.HDUList([
+            components,
+            fits.ImageHDU(wave),
+            fits.ImageHDU(),
+            fits.ImageHDU(np.array([[0.], [.1]]))
+        ]).writeto(self.pca)
 
     def test_bosz_omitted_D_reuses_explicit_grid_cache(self):
-        settings = dict(root=self.raw, R_in=300000, R_out=115000,
-                        wave_min=3800., wave_max=4200., cache_dir=self.root / 'processed')
+        settings = dict(
+            root=self.raw,
+            R_in=300000,
+            R_out=115000,
+            wave_min=3800.,
+            wave_max=4200.,
+            cache_dir=self.root / 'processed'
+        )
         manual = BOSZSpectra(D=34530, **settings)
         self.addCleanup(manual.db.close)
         flux = manual[0]
@@ -85,12 +108,20 @@ class LoaderGridTests(unittest.TestCase):
         self.assertEqual(automatic.D, 34530)
         self.assertEqual(automatic._processing_params(), manual._processing_params())
         np.testing.assert_array_equal(automatic.wave_out, manual.wave_out)
-        with patch.object(automatic, '_compute_spectrum', side_effect=AssertionError('Must reuse cache')):
+        with patch.object(
+            automatic,
+            '_compute_spectrum',
+            side_effect=AssertionError('Must reuse cache')
+        ):
             np.testing.assert_array_equal(automatic[0], flux)
 
     def test_bosz_auto_D_also_handles_inferred_bounds(self):
-        loader = BOSZSpectra(self.raw, R_in=300000, R_out=115000,
-                             samples_per_fwhm=4)
+        loader = BOSZSpectra(
+            self.raw,
+            R_in=300000,
+            R_out=115000,
+            samples_per_fwhm=4
+        )
         self.assertAlmostEqual(loader.wave_min, 3790.)
         self.assertAlmostEqual(loader.wave_max, 4210.)
         self.assertGreaterEqual(np.min(1 / (loader.R_out * np.diff(np.log(loader.wave_out)))),
@@ -99,17 +130,31 @@ class LoaderGridTests(unittest.TestCase):
     def test_telluric_auto_grid_uses_target_or_native_resolution(self):
         for resolution, expected_D in [(115000, 34530), (None, 36032)]:
             with self.subTest(resolution=resolution):
-                loader = TelluricSpectra(self.pca, wave_min=3800., wave_max=4200.,
-                                          R_out=resolution, n_pca=1)
+                loader = TelluricSpectra(
+                    self.pca,
+                    wave_min=3800.,
+                    wave_max=4200.,
+                    R_out=resolution,
+                    n_pca=1
+                )
                 self.assertEqual(loader.D, expected_D)
                 self.assertEqual(loader.M.shape, (2, expected_D))
                 self.assertTrue(np.isfinite(loader.M).all())
 
     def test_telluric_auto_grid_reuses_explicit_grid_cache(self):
-        settings = dict(wave_min=3800., wave_max=4200., R_out=115000,
-                        n_pca=1, cache_dir=self.root / 'telluric')
+        settings = dict(
+            wave_min=3800.,
+            wave_max=4200.,
+            R_out=115000,
+            n_pca=1,
+            cache_dir=self.root / 'telluric'
+        )
         manual = TelluricSpectra(self.pca, D=34530, **settings)
-        with patch.object(TelluricSpectra, '_compute', side_effect=AssertionError('Must reuse cache')):
+        with patch.object(
+            TelluricSpectra,
+            '_compute',
+            side_effect=AssertionError('Must reuse cache')
+        ):
             automatic = TelluricSpectra(self.pca, **settings)
         self.assertEqual(automatic._params(), manual._params())
         np.testing.assert_array_equal(automatic.wave_out, manual.wave_out)
