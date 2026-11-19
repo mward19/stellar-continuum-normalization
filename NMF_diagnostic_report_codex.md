@@ -1,6 +1,6 @@
 # Why the stellar NMF differs from Figure 1
 
-Analysis date: 2026-11-13. Reviewed `test_nmfs.ipynb` **including its saved plots**, `src/load_spectra.py`, `src/model.py`, `construct_big_nmf.py`, `compute_F.sh`, the requested job log and its `.err` file, cached basis arrays and JSON metadata, and three representative raw BOSZ spectra. No training code or existing caches were changed, and no full training run was repeated.
+Analysis date: 2026-11-13; revised after reading the complete published [Casey et al. (2026), ApJ 998:192](Casey_2026_ApJ_998_192.pdf). Reviewed `sandbox/nmf_basis_vectors.ipynb` **including its saved plots**, `src/load_spectra.py`, `src/model.py`, `construct_big_nmf.py`, `compute_F.sh`, the requested job log and its `.err` file, cached basis arrays and JSON metadata, and three representative raw BOSZ spectra. No training code or existing caches were changed, and no full training run was repeated.
 
 ## Main findings
 
@@ -14,7 +14,11 @@ Two other effects make the figure comparison misleading: the notebook displays a
 
 ## What is being compared
 
-The publisher PDF could not be fetched through the browser, so I inspected the authors' accepted arXiv manuscript and its actual Figure 1. Its methods specify MARCS/BOSZ rectified flux, convolution to approximately R=115,000, a 300–700 nm interval, negative-log NMF, 16 components, NNDSVD initialization with average-filled zeros, and coordinate descent. They report 10,000 training steps and approximately 30 minutes on one CPU core. Figure 1 covers roughly **3800–5000 Å**, rather than the notebook's 3800–4200 Å. [Casey et al., accepted manuscript, Section II and Figure 1](https://arxiv.org/html/2601.19973v1#S2)
+I read the supplied published [Casey_2026_ApJ_998_192.pdf](Casey_2026_ApJ_998_192.pdf), including Figure 1 on page 4. **Its labeled wavelength range is 3800–4200 Å, matching the notebook's selected window. There is no wavelength-window mismatch to correct in the notebook.** The previous report's 3800–5000 Å statement came from the arXiv figure and was incorrect for this published version.
+
+Section 2 (pages 3–4) specifies MARCS/BOSZ rectified flux, convolution to approximately R=115,000, a 300–700 nm training interval, negative-log NMF, 16 components, NNDSVD initialization with average-filled zeros, and coordinate descent. It reports 10,000 training steps and approximately 30 minutes on one CPU core. **The full training interval and the small wavelength interval displayed in Figure 1 serve different purposes.** The methods do not give a numerical D or prescribe downsampling the entire training interval to 3000 points. [Published paper, Section 2 and Table 1](Casey_2026_ApJ_998_192.pdf)
+
+The published Figure 1 does show a bottom component dominated by broad, smooth depressions with some narrow structure superposed. That is a meaningful qualitative difference from your plotted first component; the report's explanation must concern the input representation and factorization, rather than a different plotting window.
 
 The saved notebook output identifies its stellar cache as:
 
@@ -60,7 +64,7 @@ I checked a solar-composition 6000 K raw spectrum using your convolution functio
 
 ![Sampling and basis-scale diagnostics](reports/nmf_diagnostics.png)
 
-The upper panel uses a padded 3980–4030 Å extraction before convolution and displays its interior, 4000–4010 Å; it is a local diagnostic, not a rerun of the full cache pipeline. The lower panel uses the notebook's actual cached first basis vector.
+The upper panel uses a padded 3980–4030 Å extraction before convolution and displays its interior, 4000–4010 Å; it is a local diagnostic, not a rerun of the full cache pipeline. The lower panel uses the notebook's actual cached first basis vector over 3800–4200 Å, matching the published Figure 1 comparison window.
 
 ### A defensible choice of D
 
@@ -90,7 +94,7 @@ The telluric setup also uses `D=3000` over the same interval, so its narrow-line
 
 NMF does not order components by explained variance as PCA does. A permutation of the columns of W and corresponding rows of F leaves the reconstruction unchanged. `F[0]` has no universal status as a hydrogen-line component, or as the smoothest component.
 
-The broad depressions in the paper's bottom curve are consistent with broad hydrogen absorption; that is a physical interpretation of its shape, not a guaranteed property of component zero. A different factorization can distribute those features among several components. The unregularized objective in your code imposes non-negativity, but **no wavelength-smoothness constraint**.
+The published paper explicitly notes in Section 5 (page 8) that one learned component contains only strong hydrogen lines, while others isolate molecular or atomic-line structure. This supports interpreting its smooth, broad-line component physically, but does not guarantee that it must be component zero in an independent fit. The authors also caution against detailed physical interpretation of latent basis vectors. [Published paper, Section 5](Casey_2026_ApJ_998_192.pdf) A different factorization can distribute broad features among several components. The unregularized objective in your code imposes non-negativity, but **no wavelength-smoothness constraint**. Permutation freedom explains why row zero need not match; it does not establish that the whole learned basis adequately represents broad wings. That requires checking all components and reconstructed spectra.
 
 ### Basis amplitudes are also arbitrary
 
@@ -129,7 +133,7 @@ Compare reconstructions, component shapes after a stated scaling, and multiple i
 −ln(S) < 0.01  ⇔  S > exp(−0.01) ≈ 0.99005.
 ```
 
-Absorption shallower than approximately **0.995%** is replaced by exactly continuum. This changes the training target; it is not just a storage format. It can remove wings and weak blends and introduce threshold boundaries. In subsequent least squares those zeros are ordinary target values, not missing pixels.
+Absorption shallower than approximately **0.995%** is replaced by exactly continuum. This changes the training target; it is not just a storage format. Section 2 of the published paper describes clipping flux above unity but does not specify this additional 1% absorption cutoff, so it should not be assumed to be part of the replicated procedure. It can remove wings and weak blends and introduce threshold boundaries. In subsequent least squares those zeros are ordinary target values, not missing pixels.
 
 Test zero threshold or a substantially smaller threshold on a manageable subset. Measure the reconstruction cost and memory tradeoff. A large threshold should not be justified solely by a desire to call the matrix sparse.
 
@@ -137,7 +141,7 @@ Test zero threshold or a substantially smaller threshold on a manageable subset.
 
 The cache database confirms that the input products are `rorig/noresam`. STScI describes these original spectra as having parameter-dependent native resolution of roughly **200,000–600,000**. They are not a uniform R=300,000 product. [STScI BOSZ 2024 product definitions](https://archive.stsci.edu/hlsp/bosz)
 
-Your Gaussian quadrature formula is appropriate if the input and output line-spread functions are Gaussian with known widths, but its fixed `R_in=300000` assumption needs verification against the native synthesis prescription. For illustration, if a native spectrum were equivalent to Gaussian R=200,000, your added kernel would give approximately R=105,700 rather than 115,000. At R=600,000 it would give approximately R=121,900. Those examples are conditional calculations, not measurements of these spectra's actual line-spread functions.
+The published paper describes its theoretical grid as approximately R=300,000; that approximate description does not establish a common Gaussian input width for every `rorig` file in your BOSZ 2024 collection. Your Gaussian quadrature formula is appropriate if the input and output line-spread functions are Gaussian with known widths, but its fixed `R_in=300000` assumption needs verification against the native synthesis prescription. For illustration, if a native spectrum were equivalent to Gaussian R=200,000, your added kernel would give approximately R=105,700 rather than 115,000. At R=600,000 it would give approximately R=121,900. Those examples are conditional calculations, not measurements of these spectra's actual line-spread functions.
 
 This is secondary to the factor-of-32.5 sampling problem. Check native line profiles and wavelength spacing before choosing a uniform convolution prescription.
 
@@ -200,7 +204,7 @@ The installed coordinate-descent code repeatedly multiplies X and its transpose 
 
 Your Slurm script also requests `--ntasks=4`, launches one Python process, and sets only `OMP_NUM_THREADS`. That does not create four distributed NMF workers. The inspected coordinate-update kernel contains serial loops, and BLAS threading depends on the linked backend and environment. Prefer `--ntasks=1` with an explicit `--cpus-per-task`, inspect `threadpoolctl.threadpool_info()`, and benchmark thread counts. More allocated CPUs do not necessarily accelerate this solver.
 
-These facts explain why a lengthy fit is plausible, but **do not quantitatively account for the authors' much faster per-step timing**. Their effective sampling, matrix occupancy, implementation details, hardware, and timing boundaries are not established by this comparison. It would be unjustified to attribute the entire gap to one factor, or promise their timing after a single setting change. The repeats after training contribute only seconds here.
+These facts explain why a lengthy fit is plausible, but **do not quantitatively account for the authors' much faster per-step timing**. The published paper does not report a numerical training-grid D, matrix occupancy, hardware model, or detailed timing breakdown sufficient to reproduce that benchmark. Their exact grid selection and implementation details are also not established by this comparison. It would be unjustified to attribute the entire gap to one factor, or promise their timing after a single setting change. The repeats after training contribute only seconds here.
 
 Simply raising D to 300,000 for all 396,108 rows would require about **475 GB for dense float32 X alone**. A corrected sampling experiment therefore needs a deliberate memory strategy; fix the grid on a small, representative training set before scaling up.
 
@@ -210,7 +214,7 @@ Simply raising D to 300,000 for all 396,108 rows would require about **475 GB fo
 2. **Check the native-resolution prescription and remove aggressive thresholding for the diagnostic.** On this manageable subset, compare `sparse_tol=0` with 0.01 and inspect their effects on weak lines and wings. Benchmark dense versus sparse storage with the resulting occupancy.
 3. **Keep K=16 and NNDSVD-average initialization for the first comparison.** Use enough iterations to assess a stable reconstruction, then compare seeds and initialization choices. Increasing K or iteration count should follow evidence from reconstruction quality; neither restores discarded samples.
 4. **Validate on held-out spectra at the original useful resolution.** Solve non-negative weights for fixed F, reconstruct `S_hat=exp(-(W @ F))`, and inspect flux residuals, especially broad wings and narrow line forests. Report errors by stellar type and wavelength as well as a global norm. Only then test continuum recovery from representative observed spectra.
-5. **Make the figure comparison explicit.** Use 3800–5000 Å, document component rescaling, and inspect all components for broad-line structure. Compare the reconstructed absorption model before judging component ordering.
+5. **Keep the notebook's 3800–4200 Å comparison window.** It already matches the published Figure 1. Document component rescaling, and inspect all components for broad-line structure. Compare the reconstructed absorption model before judging component ordering.
 6. **Scale the training set gradually and record provenance.** Store actual iteration count, fit/evaluation timings, density, dtype, software versions, thread settings, and a manifest or hash of selected spectrum IDs. The existing cache keys include processing parameters but do not uniquely identify the input manifest. Use new cache directories when changing D or preprocessing, and bump processing/NMF version numbers for algorithm changes so old results cannot be silently reused.
 
 The strongest conclusion is that the current output is an NMF of an aggressively undersampled and thresholded spectral grid. Correct that input representation first; then evaluate reconstruction accuracy and interpret the basis plots with their scale and permutation freedom in mind.

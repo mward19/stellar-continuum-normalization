@@ -1,0 +1,1 @@
+"""Stellar continuum normalization library."""

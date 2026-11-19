@@ -1,612 +1,240 @@
-print("Importing packages")
-try:
-    from .load_spectra import BOSZSpectra
-    from .load_telluric import TelluricSpectra
-except ImportError:  # run as a script
-    from load_spectra import BOSZSpectra
-    from load_telluric import TelluricSpectra
+"""Continuum-response bases and constrained fitting of individual observations.
 
-import hashlib
-import json
-import multiprocessing
-import os
-import time
-from pathlib import Path
+Training and artifact persistence live in nmf.py and nmf_cache.py. Public classes
+are re-exported here so callers can import the complete API from src.model.
+"""
+from dataclasses import dataclass
+import warnings
 
 import numpy as np
 from scipy import sparse
 from scipy.optimize import lsq_linear
-from sklearn.decomposition import NMF, MiniBatchNMF
-from tqdm import tqdm, trange
-print("End importing")
 
-_BUILD_STATE = None # (bosz_spectra, tol, floor), set before forking so workers can reach it
+from src.nmf import SpectralNMF, TelluricNMF
+from src.nmf_cache import NMFCache, CacheMiss, CacheValidationError
 
-
-def _build_sparse_chunk(bounds):
-    bosz_spectra, tol, floor = _BUILD_STATE
-    return bosz_spectra.sparse(slice(*bounds), tol=tol, floor=floor).astype(np.float32)
+C_KMS = 299792.458
 
 
-C_KMS = 299792.458 # speed of light [km/s]
-SPARSE_VERSION = 1 # bump when the sparse -log(flux) matrix is built differently
-NMF_VERSION = 1 # bump when the NMF procedure changes in a way the params below don't capture
+def _orders(values):
+    """Accept one order, rectangular arrays, or a sequence of unequal-length orders."""
+    try:
+        array = np.asarray(values, dtype=np.float64)
+    except ValueError:
+        array = None
+    if array is not None and array.ndim == 1:
+        orders = [array]
+    elif array is not None and array.ndim == 2:
+        orders = list(array)
+    elif array is None and isinstance(values, (list, tuple)):
+        orders = [np.asarray(order, dtype=np.float64) for order in values]
+    else:
+        raise ValueError('Expected a 1-D spectrum or a sequence of 1-D echelle orders')
+    if not orders or any(order.ndim != 1 or len(order) == 0 for order in orders):
+        raise ValueError('Orders must be nonempty one-dimensional arrays')
+    return orders
+
+
+def _restore(flat, template, orders):
+    try:
+        shape = np.asarray(template).shape
+    except ValueError:
+        shape = None
+    if shape is not None:
+        return flat.reshape(shape)
+    offsets = np.cumsum([0] + [len(order) for order in orders])
+    return tuple(flat[a:b] for a, b in zip(offsets[:-1], offsets[1:]))
+
+
+class ContinuumResponseBasis:
+    """Per-order response design matrix with an injectable basis function.
+
+    basis_function(wavelengths, n_modes) returns (pixels, n_modes), evaluated
+    on each full order before any bad-pixel masking. The default is the paper's
+    Fourier prescription, including its original absolute-wavelength phase.
+    """
+    def __init__(self, n_modes=9, *, basis_function=None):
+        if not isinstance(n_modes, (int, np.integer)) or n_modes < 1:
+            raise ValueError('n_modes must be a positive integer')
+        self.n_modes = int(n_modes)
+        self.basis_function = basis_function or self.fourier_basis
+
+    @staticmethod
+    def fourier_basis(wavelengths, n_modes):
+        wave = np.asarray(wavelengths, dtype=np.float64)
+        finite = wave[np.isfinite(wave)]
+        if len(finite) < 2 or np.ptp(finite) <= 0:
+            raise ValueError('Each order requires at least two distinct finite wavelengths')
+        period = 2 * np.ptp(finite)
+        basis = np.empty((len(wave), n_modes))
+        # Preserve the original arithmetic order: tiny phase changes can affect ill-conditioned fits.
+        for j in range(1, n_modes + 1):
+            basis[:, j-1] = np.cos(np.pi*(j-1)/period*wave) if j % 2 else np.sin(np.pi*j/period*wave)
+        return basis
+
+    def design_matrix(self, order_wavelengths):
+        blocks = []
+        for wave in _orders(order_wavelengths):
+            block = np.asarray(self.basis_function(wave, self.n_modes), dtype=np.float64)
+            if block.shape != (len(wave), self.n_modes) or not np.isfinite(block[np.isfinite(wave)]).all():
+                raise ValueError('Continuum basis returned an invalid matrix')
+            blocks.append(sparse.csr_matrix(block))
+        return sparse.block_diag(blocks, format='csr')
+
+
+@dataclass
+class ContinuumFitResult:
+    alpha: np.ndarray
+    beta: np.ndarray
+    gamma: np.ndarray
+    wavelengths: object
+    continuum: object
+    stellar_flux: object
+    telluric_transmission: object
+    model_flux: object
+    rectified_flux: object
+    mask: object
+    solver_result: object
+
+    @property
+    def success(self):
+        return self.solver_result.success
+
+    @property
+    def status(self):
+        return self.solver_result.status
+
+    @property
+    def message(self):
+        return self.solver_result.message
+
+    def __iter__(self):
+        # Retain tuple-unpacking convenience for callers interested only in coefficients.
+        yield self.alpha
+        yield self.beta
+        yield self.gamma
 
 
 class ContinuumNormalizer:
-    def __init__(
-            self, 
-            bosz_spectra: BOSZSpectra, 
-            telluric_spectra: TelluricSpectra,
-            flux_errors,
-            order_wavelengths,
-            debug_max_files=None,
-            K=16, # number of stellar absorbtion basis vectors
-            L=4,  # number of telluric absorbtion basis vectors
-            n_modes=9, # Fourier continuum modes per row of order_wavelengths
-            F_kwargs=None, # passed to F_fit_method
-            G_kwargs=None, # passed to get_G
-            debug_max_F_spectra=None,
-            F_filter=None, # passed to filter_spectra before fitting F
-            F_fit_method="get_F", # method used to build F
-            force_recompute_F=False, # skip cached F and run the selected fitting method
-        ):
-        self.bosz_spectra = bosz_spectra         # Matrix S
-        self.telluric_spectra = telluric_spectra # Matrix M
+    """Assemble fitted absorption bases and solve bounded weighted least squares.
 
-        self.bosz_wave_out = bosz_spectra.wave_out # wavelengths F lives on
-        self.telluric_wave_out = telluric_spectra.wave_out # wavelengths G lives on
+    No data loading, NMF fitting, or cache lookup occurs in this constructor.
+    variance_order=1 preserves the previous weighting; 2 selects the paper's
+    second-order approximation explicitly. No instrumental broadening is applied.
+    """
+    def __init__(self, stellar, telluric=None, response_basis=None, *, variance_order=1):
+        if not isinstance(stellar, SpectralNMF):
+            raise TypeError('stellar must be a fitted SpectralNMF; call fit() or load() first')
+        stellar._require_fitted()
+        if telluric is not None:
+            if not isinstance(telluric, TelluricNMF):
+                raise TypeError('telluric must be a fitted TelluricNMF or None')
+            telluric._require_fitted()
+            for key in ('wavelength_unit', 'wavelength_convention'):
+                first, second = stellar.preprocessing.get(key), telluric.preprocessing.get(key)
+                if first not in (None, 'unspecified') and second not in (None, 'unspecified') and first != second:
+                    raise ValueError(f'Stellar and telluric {key} differ; convert explicitly before fitting')
+        if variance_order not in (1, 2):
+            raise ValueError('variance_order must be 1 or 2')
+        self.stellar, self.telluric = stellar, telluric
+        self.response_basis = response_basis if response_basis is not None else ContinuumResponseBasis()
+        if not hasattr(self.response_basis, 'design_matrix') or not hasattr(self.response_basis, 'n_modes'):
+            raise TypeError('response_basis must provide design_matrix() and n_modes')
+        self.variance_order = variance_order
 
-        self.K = K
-        self.L = L
+    @property
+    def F(self):
+        return self.stellar.components_
 
-        self.flux_errors = flux_errors
-        self.order_wavelengths = order_wavelengths
+    @property
+    def G(self):
+        return None if self.telluric is None else self.telluric.components_
 
-        if debug_max_F_spectra is not None and debug_max_F_spectra < 1:
-            raise ValueError("debug_max_F_spectra must be a positive integer or None")
-        if debug_max_F_spectra is None:
-            debug_max_F_spectra = getattr(bosz_spectra, "debug_max_F_spectra", None)
-        self.debug_max_F_spectra = None if debug_max_F_spectra is None else int(debug_max_F_spectra)
+    @property
+    def bosz_wave_out(self):
+        return self.stellar.wavelengths
 
-        self.S_log = None # sparse -log(flux) matrix, built on demand (see get_sparse_S_log)
-        self._S_log_key = None # (tol, floor) that S_log was built with
-        self.train_rows = None # rows of S_log to train on; None means all (see filter_spectra)
-        self.train_filter = None
-        self.force_recompute_F = bool(force_recompute_F)
-        if F_filter is not None:
-            self.filter_spectra(**F_filter)
+    @property
+    def telluric_wave_out(self):
+        return None if self.telluric is None else self.telluric.wavelengths
 
-        getattr(self, F_fit_method)(**(F_kwargs or {}))
-        self.get_G(**(G_kwargs or {}))
-        self.get_H(n_modes)
+    def fit(self, wavelengths, flux=None, flux_errors=None, *, rv=0., mask=None, tol=1e-10,
+            lsq_solver='lsmr', max_iter=None):
+        """Fit one observation. True in mask means retain; outputs preserve input order shapes.
 
-    def filter_spectra(self, atmos=("mp", "ms"), teff_max=8000):
+        Nonpositive/nonfinite flux/errors and wavelengths outside basis coverage are
+        excluded. Output predictions are NaN at excluded pixels. RV is a fixed
+        observed-frame stellar velocity in km/s; tellurics remain in the observer frame.
+        Use lsq_solver="exact" for a dense solve on modest subsets; the default
+        iterative solver keeps large observation design matrices sparse.
         """
-        Optional: restricts the spectra that get_F and fit_full train on. Call it before them.
-        The defaults follow Casey et al. (2026): MARCS atmospheres only (BOSZ's "mp" and "ms";
-        "ap" is ATLAS), and Teff <= 8000 K. Pass atmos=None or teff_max=None to skip either.
-        """
-        keep = []
-        for row, id in enumerate(self.bosz_spectra.ids[:self._n_F_spectra()]):
-            if atmos is not None and id.atmos not in atmos:
-                continue
-            if teff_max is not None and int(id.teff.lstrip("t")) > teff_max:
-                continue
-            keep.append(row)
-
-        self.train_rows = np.array(keep, dtype=np.int64)
-        self.train_filter = {
-            "atmos": None if atmos is None else sorted(atmos),
-            "teff_max": None if teff_max is None else float(teff_max),
-        }
-        tqdm.write(f"Training on {len(keep)} of {self._n_F_spectra()} selected spectra ({self.train_filter})")
-
-    @staticmethod
-    def _relative_residual(nmf, X):
-        """Relative Frobenius reconstruction error for a batch of spectra."""
-        X_dense = X.toarray().astype(np.float64)
-        reconstruction = nmf.transform(X).astype(np.float64) @ nmf.components_.astype(np.float64)
-        return np.linalg.norm(X_dense - reconstruction) / np.linalg.norm(X_dense)
-
-    def _report_residuals(self, nmf, rows, n_samples, seed):
-        """
-        Reports how well S_log ~ W F on a random subset of `rows`, with W solved for the final F.
-        This is computed directly in float64 on batches. (sklearn's reconstruction_err_ expands
-        |X|^2 + |WH|^2 - 2<X,WH> in float32, which cancels catastrophically on a matrix this big
-        and can come out as nan.)
-        """
-        rng = np.random.default_rng(seed)
-        sample = np.sort(rng.choice(rows, size=min(n_samples, len(rows)), replace=False))
-        squared_residual = squared_norm = 0.0
-        for a in trange(0, len(sample), 1024, unit="batch", desc="Computing NMF residuals", leave=False):
-            X = self.S_log[sample[a:a + 1024]]
-            residual = X.toarray().astype(np.float64) - nmf.transform(X).astype(np.float64) @ nmf.components_.astype(np.float64)
-            squared_residual += np.sum(residual ** 2)
-            squared_norm += np.sum(X.data.astype(np.float64) ** 2)
-        tqdm.write(
-            f"NMF residuals on {len(sample)} spectra: relative Frobenius error "
-            f"{np.sqrt(squared_residual / squared_norm):.3e}, "
-            f"rms per pixel {np.sqrt(squared_residual / (len(sample) * self.S_log.shape[1])):.3e}"
-        )
-
-    def _train_rows(self):
-        return np.arange(self._n_F_spectra()) if self.train_rows is None else self.train_rows
-
-    def get_F(self, batch=False, **kwargs):
-        """Build F with full NMF, or MiniBatchNMF when ``batch=True``."""
-        method = self.get_F_batch if batch else self.get_F_full
-        return method(**kwargs)
-
-    def _load_F_cache(self, cache_name, params):
-        if self.train_filter is not None:
-            params["filter"] = self.train_filter
-
-        cache_dir = self.bosz_spectra.cache_dir
-        if self.force_recompute_F:
-            tqdm.write(f"Skipping cached {cache_name}; force_recompute_F=True")
-            cached = None
-        else:
-            cached = self._load_nmf(cache_dir, cache_name, params)
-        if cached is not None:
-            cache_path, _ = self._nmf_cache_paths(cache_dir, cache_name, params)
-            tqdm.write(f"Loaded cached F: {cache_path}")
-            self.F = cached
-        return cache_dir, cached
-
-    @classmethod
-    def _report_F_cache_path(cls, cache_dir, cache_name, params):
-        if cache_dir is not None:
-            cache_path, _ = cls._nmf_cache_paths(cache_dir, cache_name, params)
-            tqdm.write(f"Cached F: {cache_path}")
-
-    def get_F_batch(
-            self,
-            max_epochs=1000,
-            batch_size=256,
-            seed=0,
-            sparse_tol=None,
-            sparse_floor=1e-10,
-            residual_samples=20_000,
-            tol=1e-4,
-            tol_batches=3,
-            check_interval=50,
-        ):
-        """Fit with MiniBatchNMF; check basis convergence every ``check_interval`` batches."""
-        if tol_batches < 1 or check_interval < 1:
-            raise ValueError("tol_batches and check_interval must be positive integers")
-        if sparse_tol is None:
-            sparse_tol = 1e-6
-
-        cache_name = "nmf_F"
-        params = {
-            "K": int(self.K), "max_epochs": int(max_epochs), "batch_size": int(batch_size),
-            "seed": int(seed), "solver": "minibatch", "tol": float(tol),
-            "tol_batches": int(tol_batches), "check_interval": int(check_interval),
-            "tol_metric": "relative_component_change",
-            "n_spectra": self._n_F_spectra(),
-            "bosz": self.bosz_spectra._processing_params(),
-            "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
-            "sparse_version": SPARSE_VERSION, "nmf_version": NMF_VERSION,
-        }
-        cache_dir, cached = self._load_F_cache(cache_name, params)
-        if cached is not None:
-            return
-
-        self._ensure_S_log(sparse_tol, sparse_floor)
-        rows = self._train_rows()
-        nmf_F = MiniBatchNMF(
-            n_components=self.K,
-            forget_factor=1,
-            random_state=seed,
-            verbose=False,
-        )
-        rng = np.random.default_rng(seed)
-        consecutive_converged_checks = 0
-        batches_seen = 0
-        previous_components = None
-        converged = False
-        for epoch in trange(max_epochs, unit="epoch", desc="Performing NMF on BOSZ spectra"):
-            order = rng.permutation(rows)
-            batches = [np.sort(order[a:a + batch_size]) for a in range(0, len(rows), batch_size)]
-            batch_progress = tqdm(batches, desc=f"NMF epoch {epoch + 1}/{max_epochs}", leave=False)
-            for row_batch in batch_progress:
-                nmf_F.partial_fit(self.S_log[row_batch])
-                if previous_components is None:
-                    previous_components = nmf_F.components_.copy()
-                batches_seen += 1
-                if batches_seen % check_interval:
-                    continue
-
-                sample_rows = rng.choice(rows, size=min(batch_size, len(rows)), replace=False)
-                sample_residual = self._relative_residual(nmf_F, self.S_log[sample_rows])
-                components = nmf_F.components_
-                component_change = np.linalg.norm(components - previous_components) / max(
-                    np.linalg.norm(components), np.finfo(components.dtype).eps
-                )
-                previous_components = components.copy()
-                batch_progress.set_postfix(
-                    residual=f"{sample_residual:.3e}",
-                    basis_change=f"{component_change:.3e}",
-                )
-                consecutive_converged_checks = (
-                    consecutive_converged_checks + 1 if component_change <= tol else 0
-                )
-                if consecutive_converged_checks >= tol_batches:
-                    tqdm.write(
-                        f"MiniBatchNMF converged after {epoch + 1} epochs: relative basis "
-                        f"change <= {tol:g} for {tol_batches} consecutive checks, "
-                        f"spaced {check_interval} batches apart"
-                    )
-                    converged = True
-                    break
-            # Keep the most recent complete epoch so long-running jobs can be resumed
-            # with a useful F even if they do not reach the final cache write below.
-            self._save_nmf(cache_dir, f"{cache_name}_last_epoch", params, nmf_F.components_)
-            if converged:
-                break
-
-        self._report_residuals(nmf_F, rows, residual_samples, seed)
-        self.F = nmf_F.components_
-        self._save_nmf(cache_dir, cache_name, params, self.F)
-        self._report_F_cache_path(cache_dir, cache_name, params)
-
-    def get_F_full(
-            self,
-            max_iter=10_000,
-            seed=0,
-            sparse_tol=None,
-            sparse_floor=1e-10,
-            residual_samples=20_000,
-            tol=0.0,
-            init="nndsvda",
-        ):
-        """Fit F with full coordinate-descent NMF.
-
-        Set ``tol=0`` to run exactly ``max_iter`` iterations, as in Casey et al. (2026).
-        """
-        if sparse_tol is None:
-            sparse_tol = 1e-2
-        cache_name = "nmf_F_full"
-        params = {
-            "K": int(self.K), "max_iter": int(max_iter), "seed": int(seed),
-            "tol": float(tol), "init": init, "solver": "cd",
-            "n_spectra": self._n_F_spectra(),
-            "bosz": self.bosz_spectra._processing_params(),
-            "sparse_tol": float(sparse_tol), "sparse_floor": float(sparse_floor),
-            "sparse_version": SPARSE_VERSION, "nmf_version": NMF_VERSION,
-        }
-        cache_dir, cached = self._load_F_cache(cache_name, params)
-        if cached is not None:
-            return
-
-        stage_start = time.perf_counter()
-        tqdm.write("Preparing sparse BOSZ matrix")
-        self._ensure_S_log(sparse_tol, sparse_floor)
-        tqdm.write(
-            f"Sparse BOSZ matrix ready: shape={self.S_log.shape}, "
-            f"nnz={self.S_log.nnz:,}, elapsed={time.perf_counter() - stage_start:.1f}s"
-        )
-
-        rows = self._train_rows()
-        stage_start = time.perf_counter()
-        tqdm.write(f"Selecting {len(rows):,} training rows from sparse matrix")
-        tqdm.write(
-            f"[NMF] Gathering {len(self.train_rows) if self.train_rows is not None else self.S_log.shape[0]:,} "
-            "training rows into the fit matrix...",
-        )
-        row_start = time.perf_counter()
-        X = self.S_log if self.train_rows is None else self.S_log[self.train_rows]
-        tqdm.write(
-            f"[NMF] Fit matrix ready: shape={X.shape}, nnz={X.nnz:,} "
-            f"({time.perf_counter() - row_start:.1f}s)",
-        )
-        tqdm.write(
-            f"Training matrix ready: shape={X.shape}, nnz={X.nnz:,}, "
-            f"density={X.nnz / np.prod(X.shape):.2%}, "
-            f"selection_elapsed={time.perf_counter() - stage_start:.1f}s"
-        )
-        nmf_F = NMF(
-            n_components=self.K,
-            init=init,
-            solver="cd",
-            max_iter=max_iter,
-            tol=tol,
-            random_state=seed,
-            shuffle=True,
-            verbose=1,
-        )
-        tqdm.write(
-            f"Starting NMF initialization and coordinate descent "
-            f"(max_iter={max_iter}, init={init})"
-        )
-        stage_start = time.perf_counter()
-        fit_start = time.perf_counter()
-        tqdm.write(
-            "[NMF] Entering sklearn NMF.fit (initialization may take a while)...",
-        )
-        nmf_F.fit(X)
-        tqdm.write(
-            f"[NMF] NMF.fit finished ({time.perf_counter() - fit_start:.1f}s)",
-        )
-        tqdm.write(
-            f"NMF fit finished after {nmf_F.n_iter_} iterations, "
-            f"elapsed={time.perf_counter() - stage_start:.1f}s"
-        )
-        self._report_residuals(nmf_F, rows, residual_samples, seed)
-        self.F = nmf_F.components_
-        self._save_nmf(cache_dir, cache_name, params, self.F)
-        self._report_F_cache_path(cache_dir, cache_name, params)
-
-    def fit_full(self, max_iter=10_000, seed=0, tol=0.0, init="nndsvda", sparse_tol=1e-2, sparse_floor=1e-10, residual_samples=20_000):
-        """Compatibility wrapper for ``get_F(batch=False, ...)``."""
-        return self.get_F_full(
-            max_iter=max_iter,
-            seed=seed,
-            sparse_tol=sparse_tol,
-            sparse_floor=sparse_floor,
-            residual_samples=residual_samples,
-            tol=tol,
-            init=init,
-        )
-
-    def get_G(self, max_iter=10_000, seed=0):
-        """
-        Performs NMF on the dense -log(T) matrix self.telluric_spectra.M. This calculates the
-        matrix G of telluric absorbtion basis vectors.
-        """
-        params = {
-            "L": int(self.L), "max_iter": int(max_iter), "seed": int(seed), "solver": "cd",
-            "telluric": self.telluric_spectra._params(),
-            "nmf_version": NMF_VERSION,
-        }
-        cache_dir = self.telluric_spectra.cache_dir
-        cached = self._load_nmf(cache_dir, "nmf_G", params)
-        if cached is not None:
-            tqdm.write(f"Loaded cached G from {cache_dir}")
-            self.G = cached
-            return
-
-        tqdm.write("Performing NMF on telluric data")
-        nmf_G = NMF(
-            n_components=self.L,
-            solver="cd",
-            max_iter=max_iter,
-            random_state=seed,
-        )
-        nmf_G.fit(self.telluric_spectra.M)
-
-        tqdm.write("NMF on telluric data complete")
-        self.G = nmf_G.components_
-        self._save_nmf(cache_dir, "nmf_G", params, self.G)
-
-    @staticmethod
-    def _fourier_basis(order_wavelengths, n_modes):
-        """
-        Fourier design matrix for ONE echelle order (Casey et al. 2026, Eq. 9), shape (N, n_modes).
-
-        With j = 1..n_modes, column j is cos((j-1)*pi*wave/P) for odd j (so j = 1 is all ones) and
-        sin(j*pi*wave/P) for even j, where P is twice the wavelength range of the order.
-        """
-        wave = np.asarray(order_wavelengths, dtype=np.float64)
-        P = 2 * (wave.max() - wave.min())
-
-        basis = np.empty((len(wave), n_modes))
-        for j in range(1, n_modes + 1): # j counts from 1, as in the paper
-            if j % 2 == 1:
-                basis[:, j - 1] = np.cos(np.pi * (j - 1) / P * wave) # j = 1 is the constant column
-            else:
-                basis[:, j - 1] = np.sin(np.pi * j / P * wave)
-        return basis
-
-    def get_H(self, n_modes=9):
-        """
-        Builds the continuum design matrix self.H, so that log(continuum) = H @ gamma.
-
-        self.order_wavelengths has shape (n_orders, n_pixels). Each order has its own Fourier
-        basis (with P set by that order's own wavelength range), and the bases are stacked
-        block-diagonally: self.H is a sparse (n_orders * n_pixels, n_orders * n_modes) matrix
-        whose rows follow order_wavelengths.ravel().
-        """
-        wave = np.atleast_2d(np.asarray(self.order_wavelengths, dtype=np.float64))
-        self.n_modes = n_modes
-        self.H = sparse.block_diag([self._fourier_basis(w, n_modes) for w in wave], format="csr")
-
-    def fit(self, flux, rv=0.0):
-        """
-        Weighted least squares for the stellar (alpha), telluric (beta) and continuum (gamma)
-        coefficients of one observed spectrum (Casey et al. 2026, Eqs. 10-13), with the
-        constraints alpha >= 0 and beta >= 0.
-
-        The model for Y = log(flux) is  Y = -alpha @ F - beta @ G + H @ gamma,  with the
-        covariance of Y taken as diagonal, sigma_Y = flux_errors / flux.
-
-        flux: array with the same shape as self.order_wavelengths (n_orders, n_pixels). The
-            wavelengths (self.order_wavelengths) and errors (self.flux_errors) given to __init__
-            are in the observer's frame.
-        rv: stellar radial velocity in km/s (observer's frame). F is shifted to the observed
-            frame; the data and G are not, since telluric lines don't move with the star.
-
-        Returns alpha (K,), beta (L,) and gamma (n_orders, n_modes).
-        """
-        wave = np.asarray(self.order_wavelengths, dtype=np.float64).ravel()
-        flux = np.asarray(flux, dtype=np.float64).ravel()
-        flux_err = np.asarray(self.flux_errors, dtype=np.float64).ravel()
-
-        # Drop pixels where the log or its variance is undefined
-        good = np.isfinite(wave) & np.isfinite(flux) & np.isfinite(flux_err) & (flux > 0) & (flux_err > 0)
-        wave, flux, flux_err = wave[good], flux[good], flux_err[good]
-
-        Y = np.log(flux)
-        weight = flux / flux_err # 1 / sigma_Y
-
-        # Basis vectors on the observed wavelengths
-        F = np.stack([np.interp(wave / (1 + rv / C_KMS), self.bosz_wave_out, f) for f in self.F], axis=1)
-        G = np.stack([np.interp(wave, self.telluric_wave_out, g) for g in self.G], axis=1)
-        H = self.H[good]
-
-        # A weighted by 1/sigma turns the weighted problem into an ordinary bounded one
-        A = sparse.hstack([sparse.csr_matrix(-F), sparse.csr_matrix(-G), H], format="csr")
-        A = sparse.diags(weight) @ A
-
+        if flux is None and hasattr(self, '_legacy_observation'):
+            flux = wavelengths
+            wavelengths, flux_errors = self._legacy_observation
+        if flux is None or flux_errors is None:
+            raise ValueError('Provide wavelengths, flux, and flux_errors for this observation')
+        if lsq_solver not in ('lsmr', 'exact'):
+            raise ValueError("lsq_solver must be 'lsmr' or 'exact'")
+        if not np.isfinite(rv) or 1 + rv/C_KMS <= 0:
+            raise ValueError('Invalid observed-frame radial velocity')
+        wave_orders, flux_orders, error_orders = map(_orders, (wavelengths, flux, flux_errors))
+        lengths = [len(order) for order in wave_orders]
+        if [len(order) for order in flux_orders] != lengths or [len(order) for order in error_orders] != lengths:
+            raise ValueError('Wavelengths, flux and errors must have matching order shapes')
+        wave, observed, errors = map(np.concatenate, (wave_orders, flux_orders, error_orders))
+        rest_wave = wave/(1 + rv/C_KMS)
+        good = np.isfinite(wave) & np.isfinite(observed) & np.isfinite(errors) & (observed > 0) & (errors > 0)
+        good &= (rest_wave >= self.stellar.wavelengths[0]) & (rest_wave <= self.stellar.wavelengths[-1])
+        if self.telluric is not None:
+            good &= (wave >= self.telluric.wavelengths[0]) & (wave <= self.telluric.wavelengths[-1])
+        if mask is not None:
+            mask_orders = _orders(mask)
+            if [len(order) for order in mask_orders] != lengths:
+                raise ValueError('Mask must match the observed order shapes')
+            flat_mask = np.concatenate(mask_orders)
+            if not np.isin(flat_mask, [0, 1]).all():
+                raise ValueError('Mask entries must be boolean')
+            good &= flat_mask.astype(bool)
+        if not good.any():
+            raise ValueError('No usable pixels remain after masking and coverage checks')
+        H = self.response_basis.design_matrix(wavelengths)[good]
+        F = self.stellar.evaluate(rest_wave[good]).T
+        G = self.telluric.evaluate(wave[good]).T if self.telluric is not None else np.empty((good.sum(), 0))
+        ratio = (errors[good]/observed[good])**2
+        weight = 1/np.sqrt(ratio + .5*ratio**2) if self.variance_order == 2 else observed[good]/errors[good]
+        A = sparse.hstack([sparse.csr_matrix(-F), sparse.csr_matrix(-G), H], format='csr')
+        weighted_A = sparse.diags(weight) @ A
         K, L = F.shape[1], G.shape[1]
-        lower = np.concatenate([np.zeros(K + L), np.full(H.shape[1], -np.inf)])
-        upper = np.full(K + L + H.shape[1], np.inf)
-
-        result = lsq_linear(A, weight * Y, bounds=(lower, upper), method="trf", lsq_solver="lsmr")
-        X = result.x
-        return X[:K], X[K:K + L], X[K + L:].reshape(-1, self.n_modes)
-
-    # ---- Caching and data management ----
-
-    @classmethod
-    def from_cache(cls, F_path, G_path, flux_errors, order_wavelengths, n_modes=9):
-        """
-        Builds a normalizer from already-cached NMF results (the nmf_F_<hash>.npy and
-        nmf_G_<hash>.npy files), without constructing BOSZSpectra or TelluricSpectra. The
-        wavelength grids F and G live on are rebuilt from the parameters in the .json beside
-        each file.
-        """
-        F_path, G_path = Path(F_path), Path(G_path)
-        self = cls.__new__(cls) # skip __init__, which would compute or look up F and G
-        self.S_log, self._S_log_key, self.train_rows, self.train_filter = None, None, None, None
-
-        self.F = np.load(F_path)
-        self.G = np.load(G_path)
-        self.K, self.L = len(self.F), len(self.G)
-
-        bosz = json.loads(F_path.with_suffix(".json").read_text())["bosz"]
-        telluric = json.loads(G_path.with_suffix(".json").read_text())["telluric"]
-        self.bosz_wave_out = np.geomspace(bosz["wave_min"], bosz["wave_max"], bosz["D"])
-        self.telluric_wave_out = np.geomspace(telluric["wave_min"], telluric["wave_max"], telluric["D"])
-
-        self.flux_errors = flux_errors
-        self.order_wavelengths = order_wavelengths
-        self.get_H(n_modes)
-        return self
-
-    # ---- Sparse matrix and NMF cache helpers ----
-
-    @staticmethod
-    def _nmf_cache_paths(cache_dir, name, params, suffix=".npy"):
-        # Parameters are hashed into the file name so different settings can coexist in one
-        # cache_dir; the json beside the data file records what they were.
-        key = hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()[:10]
-        return cache_dir / f"{name}_{key}{suffix}", cache_dir / f"{name}_{key}.json"
+        lower = np.r_[np.zeros(K+L), np.full(H.shape[1], -np.inf)]
+        solve_matrix = weighted_A.toarray() if lsq_solver == 'exact' else weighted_A
+        solved = lsq_linear(solve_matrix, weight*np.log(observed[good]), bounds=(lower, np.inf),
+                            method='trf', lsq_solver=lsq_solver, tol=tol, max_iter=max_iter)
+        alpha, beta, gamma = solved.x[:K], solved.x[K:K+L], solved.x[K+L:]
+        stellar_flux = np.exp(-F @ alpha)
+        telluric_transmission = np.exp(-G @ beta)
+        continuum = np.exp(H @ gamma)
+        def pack(values):
+            full = np.full(len(wave), np.nan)
+            full[good] = values
+            return _restore(full, wavelengths, wave_orders)
+        return ContinuumFitResult(alpha=alpha, beta=beta,
+                gamma=gamma.reshape(len(wave_orders), self.response_basis.n_modes), wavelengths=wavelengths,
+                continuum=pack(continuum), stellar_flux=pack(stellar_flux),
+                telluric_transmission=pack(telluric_transmission), model_flux=pack(np.exp(A @ solved.x)),
+                rectified_flux=pack(observed[good]/continuum), mask=_restore(good, wavelengths, wave_orders), solver_result=solved)
 
     @classmethod
-    def _load_nmf(cls, cache_dir, name, params):
-        if cache_dir is None:
-            return None
-        npy_path, json_path = cls._nmf_cache_paths(cache_dir, name, params)
-        if json_path.is_file() and npy_path.is_file(): # json is written last
-            return np.load(npy_path)
-        return None
+    def from_cache(cls, F_path, G_path=None, flux_errors=None, order_wavelengths=None, n_modes=9):
+        """Compatibility adapter for explicit legacy or versioned F/G artifact paths."""
+        model = cls(SpectralNMF.load(F_path), None if G_path is None else TelluricNMF.load(G_path),
+                    ContinuumResponseBasis(n_modes))
+        if flux_errors is not None or order_wavelengths is not None:
+            if flux_errors is None or order_wavelengths is None:
+                raise ValueError('Legacy observation defaults require wavelengths and errors together')
+            warnings.warn('Pass wavelengths and flux_errors to fit() instead of from_cache()', DeprecationWarning, stacklevel=2)
+            model._legacy_observation = (order_wavelengths, flux_errors)
+        return model
 
-    @classmethod
-    def _save_nmf(cls, cache_dir, name, params, array):
-        if cache_dir is None:
-            return
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        npy_path, json_path = cls._nmf_cache_paths(cache_dir, name, params)
-
-        # Same scheme as the loaders: write to a temp name, rename, json last
-        tmp_npy = npy_path.with_name(npy_path.name + f".{os.getpid()}.tmp")
-        with open(tmp_npy, "wb") as f:
-            np.save(f, array)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_npy, npy_path)
-
-        tmp_json = json_path.with_name(json_path.name + f".{os.getpid()}.tmp")
-        tmp_json.write_text(json.dumps(params, indent=2, sort_keys=True))
-        os.replace(tmp_json, json_path)
-
-    @staticmethod
-    def _load_sparse_matrix_with_progress(npz_path):
-        """Load a cached sparse matrix while reporting bytes read from its NPZ file."""
-        file_size = npz_path.stat().st_size
-        with open(npz_path, "rb") as file:
-            with tqdm.wrapattr(
-                    file,
-                    "read",
-                    total=file_size,
-                    desc="Loading cached sparse matrix",
-                    unit="B",
-                    unit_scale=True,
-                ) as progress_file:
-                return sparse.load_npz(progress_file).tocsr()
-
-    def get_sparse_S_log(self, tol=1e-2, floor=1e-10, chunk_size=1000, n_workers=None):
-        """
-        Builds the sparse -log(flux) matrix of the selected BOSZ spectra (float32 CSR, one row
-        per spectrum), so NMF epochs can index rows instead of rereading and reprocessing every
-        spectrum. It is cached as an .npz in the BOSZ cache_dir and held in memory in self.S_log.
-
-        tol and floor are passed to BOSZSpectra.sparse. Multiprocess chunk building requires the
-        selected spectra to be cached already (see BOSZSpectra.process_all_spectra).
-        """
-        n = self._n_F_spectra()
-        params = {
-            "tol": float(tol), "floor": float(floor),
-            "n_spectra": n,
-            "bosz": self.bosz_spectra._processing_params(),
-            "sparse_version": SPARSE_VERSION,
-        }
-        cache_dir = self.bosz_spectra.cache_dir
-        if cache_dir is not None:
-            npz_path, json_path = self._nmf_cache_paths(cache_dir, "sparse_S_log", params, ".npz")
-            if json_path.is_file() and npz_path.is_file(): # json is written last
-                self.S_log = self._load_sparse_matrix_with_progress(npz_path)
-                self._S_log_key = (float(tol), float(floor))
-                return
-
-        bounds = [(a, min(a + chunk_size, n)) for a in range(0, n, chunk_size)]
-        if n_workers is None:
-            n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", len(os.sched_getaffinity(0))))
-
-        global _BUILD_STATE
-        _BUILD_STATE = (self.bosz_spectra, tol, floor)
-        if n_workers <= 1:
-            chunks = [_build_sparse_chunk(b) for b in tqdm(bounds, unit="chunk", desc="Building sparse -log(flux) matrix")]
-        else:
-            # Workers must not compute or touch the sqlite connection they inherit through fork, so
-            # check that everything is cached and load the location index before forking
-            needed_ids = set(self.bosz_spectra.ids[:n])
-            if not needed_ids.issubset(self.bosz_spectra._cached_ids()):
-                raise RuntimeError("Not every selected BOSZ spectrum is cached; run BOSZSpectra.process_all_spectra first")
-            self.bosz_spectra._location_index()
-            with multiprocessing.get_context("fork").Pool(n_workers) as pool:
-                chunks = list(tqdm(pool.imap(_build_sparse_chunk, bounds), total=len(bounds),
-                                   unit="chunk", desc=f"Building sparse -log(flux) matrix ({n_workers} workers)"))
-        self.S_log = sparse.vstack(chunks, format="csr")
-        self._S_log_key = (float(tol), float(floor))
-        tqdm.write(f"Sparse matrix: shape {self.S_log.shape}, density {self.S_log.nnz / np.prod(self.S_log.shape):.2%}, "
-                   f"{(self.S_log.data.nbytes + self.S_log.indices.nbytes + self.S_log.indptr.nbytes) / 1e9:.2f} GB")
-
-        if cache_dir is not None:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp_npz = npz_path.with_name(npz_path.name + f".{os.getpid()}.tmp")
-            with open(tmp_npz, "wb") as f:
-                sparse.save_npz(f, self.S_log, compressed=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_npz, npz_path)
-
-            tmp_json = json_path.with_name(json_path.name + f".{os.getpid()}.tmp")
-            tmp_json.write_text(json.dumps(params, indent=2, sort_keys=True))
-            os.replace(tmp_json, json_path)
-
-    def _ensure_S_log(self, tol, floor):
-        """Builds (or loads) S_log unless the one in memory was made with the same tol and floor."""
-        if self.S_log is None or self._S_log_key != (float(tol), float(floor)):
-            self.S_log = None # let the old matrix go before building another
-            self.get_sparse_S_log(tol=tol, floor=floor)
-
-    def _n_F_spectra(self):
-        """Number of BOSZ rows selected for building and training F."""
-        n = len(self.bosz_spectra)
-        return n if self.debug_max_F_spectra is None else min(n, self.debug_max_F_spectra)
 
 def read_harps_e2ds(path):
     """

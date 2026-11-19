@@ -15,6 +15,12 @@ import numpy as np
 from scipy import sparse
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm, trange
+from threadpoolctl import threadpool_limits
+
+try:
+    from .wavelength import log_wavelength_grid
+except ImportError:  # run as a script
+    from wavelength import log_wavelength_grid
 
 
 @dataclass(frozen=True) # frozen so the ID can be hashed
@@ -31,6 +37,11 @@ class SpectrumID:
 
 _WORKER_SPECTRA = None # set before forking so workers can reach the instance
 
+def _init_compute_worker():
+    # Parallelism comes from processes here, rather than nested numerical threads.
+    threadpool_limits(limits=1)
+
+
 def _compute_item(id):
     return id, _WORKER_SPECTRA._compute_spectrum(id)
 
@@ -45,12 +56,13 @@ class BOSZSpectra:
             root: Path, 
             R_in, 
             R_out, 
-            D, # Output resolution
+            D=None, # None: choose samples_per_fwhm points per target resolution element
             wave_min=None, 
             wave_max=None,
             cache_dir=None,
             spectra_per_file=1000, # Number of spectra stored in each cached .npy file
             debug_max_F_spectra=None,
+            samples_per_fwhm=3.0,
         ):
         self.root = root
         self.use_cache = cache_dir is not None
@@ -85,9 +97,12 @@ class BOSZSpectra:
             if self.wave_max is None:
                 self.wave_max = max
 
-        # Output downsampling wavelengths
-        self.D = D
-        self.wave_out = np.geomspace(self.wave_min, self.wave_max, self.D)
+        # Resolve D before opening the cache: equal output grids share cached flux.
+        self.samples_per_fwhm = samples_per_fwhm
+        self.wave_out = log_wavelength_grid(
+            self.wave_min, self.wave_max, D=D, resolving_power=self.R_out,
+            samples_per_fwhm=samples_per_fwhm)
+        self.D = len(self.wave_out)
 
         # Cache: spectra waiting to be written to the next group file
         self._pending = {} # SpectrumID -> processed spectrum
@@ -152,22 +167,26 @@ class BOSZSpectra:
         mask = (wave >= self.wave_min) & (wave <= self.wave_max)
         spectrum = spectrum[mask]
 
-        # Downsample to desired resolution
+        # Resample to the requested number of wavelength samples
         spectrum = np.interp(self.wave_out, wave[mask], spectrum)
 
         # Clip to [0, 1]
         return np.clip(spectrum, 0, 1)
 
-    def sparse(self, i, tol=1e-2, floor=1e-10):
+    def optical_depth(self, i, tol=1e-2, floor=1e-10, *, progress=None):
+        """Dense -log(flux), shape (n, D), with an optional absorption threshold.
+
+        Preserve the processed flux precision through the logarithm. Preparation
+        converts the result to float32 for training. progress(n) reports reads.
         """
-        Optical depth -log(flux) for a slice (or one index) as a scipy CSR matrix of shape (n, D).
-        Entries below `tol` are dropped, which is what makes it sparse; flux is floored at
-        `floor` so fully saturated lines give a finite value rather than inf.
-        """
-        dense = np.atleast_2d(self[i])
-        tau = -np.log(np.clip(dense, floor, 1.0))
+        flux = np.atleast_2d(self._read_spectra(i, progress=progress))
+        tau = -np.log(np.clip(flux, floor, 1.0))
         tau[tau < tol] = 0
-        return sparse.csr_matrix(tau)
+        return tau
+
+    def sparse(self, i, tol=1e-2, floor=1e-10, *, progress=None):
+        """CSR optical depth; explicitly requested sparse access remains available."""
+        return sparse.csr_matrix(self.optical_depth(i, tol=tol, floor=floor, progress=progress))
 
     # ---- Caching and data management ----
 
@@ -429,45 +448,46 @@ class BOSZSpectra:
         max_spectra = self.debug_max_F_spectra if debug_max_F_spectra is None else int(debug_max_F_spectra)
         ids = self.ids if max_spectra is None else self.ids[:max_spectra]
 
+        self.process_spectra(ids, force_recompute=force_recompute, n_workers=n_workers)
+
+    def process_spectra(self, ids, *, force_recompute=False, n_workers=None):
+        """Cache selected SpectrumIDs; only the parent process writes cache files/SQLite.
+
+        Unlike process_all_spectra(), the caller supplies the already limited selection.
+        Workers read raw files and compute flux without accessing the cache database.
+        """
+        if not self.use_cache:
+            raise ValueError('Processing selected spectra requires a cache_dir')
+        ids = list(dict.fromkeys(ids))
         if n_workers is None:
             n_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", len(os.sched_getaffinity(0))))
+        if not isinstance(n_workers, (int, np.integer)) or n_workers < 1:
+            raise ValueError('n_workers must be a positive integer')
 
-        if force_recompute:
-            todo = list(ids)
-            n_finished = 0
-        else:
-            cached = self._cached_ids() # one query; per-id is_cached is very slow at this scale
-            todo = [id for id in ids if id not in cached]
-            n_finished = len(ids) - len(todo)
-
-        # Counts finished spectra out of all of them, including ones already cached
-        pbar = tqdm(
-            total=len(ids), initial=n_finished,
-            unit='spectra', desc="Finished spectra", mininterval=10,
-        )
-
-        if n_workers <= 1:
-            for id in todo:
-                if max_spectra is not None and n_finished >= max_spectra:
-                    break
-                self.process_spectrum(id, force_recompute)
-                n_finished += 1
-                pbar.update(1)
-        else:
-            # fork: workers inherit self via a global (self holds the sqlite
-            # connection and can't be pickled); they never touch the db
-            global _WORKER_SPECTRA
-            _WORKER_SPECTRA = self
-            with multiprocessing.get_context("fork").Pool(n_workers) as pool:
-                for id, spectrum in pool.imap_unordered(_compute_item, todo, chunksize=4):
-                    if max_spectra is not None and n_finished >= max_spectra:
-                        break
-                    self._add_pending(id, spectrum)
-                    n_finished += 1
-                    pbar.update(1)
-
-        pbar.close()
-        self.flush_cache()
+        cached = set() if force_recompute else self._cached_ids()
+        todo = [id for id in ids if id not in cached]
+        with tqdm(total=len(ids), initial=len(ids) - len(todo), unit='spectra',
+                  desc="Processing selected BOSZ flux") as progress:
+            try:
+                if n_workers == 1:
+                    for id in todo:
+                        self.process_spectrum(id, force_recompute)
+                        progress.update(1)
+                elif todo:
+                    # fork inherits the loader; _compute_item never uses its SQLite connection.
+                    global _WORKER_SPECTRA
+                    _WORKER_SPECTRA = self
+                    try:
+                        with multiprocessing.get_context("fork").Pool(
+                                min(n_workers, len(todo)), initializer=_init_compute_worker) as pool:
+                            for id, spectrum in pool.imap_unordered(_compute_item, todo, chunksize=1):
+                                self._add_pending(id, spectrum)
+                                progress.update(1)
+                    finally:
+                        _WORKER_SPECTRA = None
+            finally:
+                # Retain completed results even when another spectrum fails.
+                self.flush_cache()
 
     def process_spectrum(self, id, force_recompute=False):
         """
@@ -491,17 +511,31 @@ class BOSZSpectra:
         if len(self._pending) >= self.spectra_per_file:
             self.flush_cache()
 
-    def __getitem__(self, i):
-        # A slice or a sequence of indices returns a 2D array of shape (n, D), one spectrum per row
+    def _read_spectra(self, i, *, progress=None):
+        # Preserve bulk cached reads, but report each slow uncached read as it completes.
         if isinstance(i, (slice, list, tuple, np.ndarray)):
             ids = self.ids[i] if isinstance(i, slice) else [self.ids[j] for j in i]
             if len(ids) == 0:
                 return np.empty((0, len(self.wave_out)))
             batch = self._read_cached_batch(ids)
             if batch is not None:
+                if progress is not None:
+                    progress(len(ids))
                 return batch
-            return np.stack([self.process_spectrum(id) for id in ids])
-        return self.process_spectrum(self.ids[i])
+            rows = []
+            for id in ids:
+                rows.append(self.process_spectrum(id))
+                if progress is not None:
+                    progress(1)
+            return np.stack(rows)
+        spectrum = self.process_spectrum(self.ids[i])
+        if progress is not None:
+            progress(1)
+        return spectrum
+
+    def __getitem__(self, i):
+        # Slices and index sequences return a 2-D array; a single index returns a spectrum.
+        return self._read_spectra(i)
 
     def __len__(self):
         return len(self.ids)

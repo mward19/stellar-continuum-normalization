@@ -1157,7 +1157,7 @@ wheels = [
 [[package]]
 name = "stellar-continuum-normalization"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "astropy" },
     { name = "marimo" },
@@ -1166,6 +1166,7 @@ dependencies = [
     { name = "pandas" },
     { name = "scikit-learn" },
     { name = "scipy" },
+    { name = "threadpoolctl" },
     { name = "tqdm" },
 ]
 
@@ -1178,6 +1179,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=3.0.6" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
     { name = "scipy", specifier = ">=1.18.1" },
+    { name = "threadpoolctl", specifier = ">=3.6.0" },
     { name = "tqdm", specifier = ">=4.70.1" },
 ]
 

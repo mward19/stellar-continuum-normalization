@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "stellar-continuum-normalization"
 version = "0.1.0"
-description = "Add your description here"
+description = "Constrained stellar and telluric absorption models for continuum normalization"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -13,4 +17,11 @@ dependencies = [
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
     "tqdm>=4.70.1",
+    "threadpoolctl>=3.6.0",
 ]
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

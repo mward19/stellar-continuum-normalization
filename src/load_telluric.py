@@ -9,8 +9,10 @@ from tqdm import tqdm
 
 try:
     from .load_spectra import BOSZSpectra
+    from .wavelength import log_wavelength_grid
 except ImportError:  # run as a script
     from load_spectra import BOSZSpectra
+    from wavelength import log_wavelength_grid
 
 
 class TelluricSpectra:
@@ -24,7 +26,7 @@ class TelluricSpectra:
         tau = max(sinh(z), 0)     # the file stores arcsinh(optical depth)
         T   = exp(-tau)
     Then T is optionally convolved to `R_out` and interpolated onto `wave_out`,
-    which is the same grid BOSZSpectra uses. `self.M` is -log(T), the nonnegative
+    using a constant-log wavelength grid, independently of the stellar basis. `self.M` is -log(T), the nonnegative
     matrix that gets factorized by NMF.
     """
 
@@ -35,16 +37,16 @@ class TelluricSpectra:
     def __init__(
             self,
             pca_file: Path,
-            D, # Output resolution; must match BOSZSpectra
-            wave_min,
-            wave_max,
+            D=None, # None: choose samples_per_fwhm points per resolution element
+            wave_min=None,
+            wave_max=None,
             R_out=None, # None: keep the file's native resolution
             n_pca=4, # number of PCA components used for the reconstruction
             t_floor=1e-10, # transmission floor so that -log(T) stays finite
             cache_dir=None,
+            samples_per_fwhm=3.0,
         ):
         self.pca_file = Path(pca_file)
-        self.D = D
         self.wave_min = wave_min
         self.wave_max = wave_max
         self.R_out = R_out
@@ -59,8 +61,13 @@ class TelluricSpectra:
         if self.R_out is not None and self.R_out >= self.R_in:
             raise ValueError(f"R_out ({self.R_out}) must be below the file's resolution ({self.R_in})")
 
-        # Output wavelengths, identical to BOSZSpectra.wave_out
-        self.wave_out = np.geomspace(self.wave_min, self.wave_max, self.D)
+        # With no convolution, sample at the native resolution from the filename.
+        self.samples_per_fwhm = samples_per_fwhm
+        resolution = self.R_in if self.R_out is None else self.R_out
+        self.wave_out = log_wavelength_grid(
+            self.wave_min, self.wave_max, D=D, resolving_power=resolution,
+            samples_per_fwhm=samples_per_fwhm)
+        self.D = len(self.wave_out)
 
         self.M = self._load_cache() if self.cache_dir is not None else None
         if self.M is None:

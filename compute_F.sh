@@ -1,7 +1,8 @@
 #!/bin/bash
 
 #SBATCH --time=24:00:00   # walltime
-#SBATCH --ntasks=4   # number of processor cores (i.e. tasks)
+#SBATCH --ntasks=1   # number of processor cores (i.e. tasks)
+#SBATCH --cpus-per-task=8
 #SBATCH --nodes=1   # number of nodes
 #SBATCH --mem-per-cpu=32G   # memory per CPU core
 #SBATCH --job-name=spectral_NMF_marcs

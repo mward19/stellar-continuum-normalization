@@ -1,4 +1,4 @@
-"""Run with: uv run --with pytest pytest test_load_telluric.py --basetemp ~/nobackup/autodelete/tmp/codex/pytest"""
+"""Run with: uv run --with pytest pytest tests/test_load_telluric.py --basetemp ~/nobackup/autodelete/tmp/codex/pytest"""
 from pathlib import Path
 
 import numpy as np

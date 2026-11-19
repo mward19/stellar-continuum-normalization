@@ -3,3 +3,18 @@ __marimo__
 .python-version
 logs/
 __pycache__
+
+# Generated subset experiment arrays and plots; the notebook stores its reviewable outputs.
+reports/bosz_subset_validation/
+
+# Persistent model and processed-data folders used by the README examples.
+/cache/
+
+.pytest_cache/
+
+.ipynb_checkpoints/
+
+# Python packaging build artifacts.
+*.egg-info/
+/build/
+/dist/
